@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LAST MILE — Game Design Document</title>
+<style>
+  :root {
+    --ink: #e8e2d6;
+    --dim: #9a9184;
+    --faint: #6b6459;
+    --bg: #14120f;
+    --panel: #1c1915;
+    --line: #2e2a24;
+    --amber: #ffb04a;
+    --rust: #c96f3b;
+    --moss: #6d7a52;
+    --salvage: #7fe0c0;
+    --blood: #d4533f;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 28px 120px; }
+
+  /* hero */
+  header.hero {
+    position: relative;
+    margin: 0 -28px 64px;
+    padding: 96px 28px 80px;
+    overflow: hidden;
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(120% 90% at 70% 110%, rgba(255,176,74,0.14), transparent 60%),
+      radial-gradient(80% 60% at 20% 0%, rgba(109,122,82,0.10), transparent 70%),
+      linear-gradient(180deg, #100e0c 0%, #171410 62%, #1b1712 100%);
+  }
+  header.hero::after {
+    content: "";
+    position: absolute; left: 0; right: 0; bottom: 0; height: 120px;
+    background:
+      repeating-linear-gradient(0deg, transparent 0 38px, rgba(255,255,255,0.012) 38px 39px),
+      linear-gradient(180deg, transparent, rgba(0,0,0,0.35));
+    pointer-events: none;
+  }
+  .kicker {
+    font: 600 11px/1 var(--mono);
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin: 0 0 22px;
+  }
+  h1 {
+    font: 800 clamp(44px, 9vw, 84px)/0.94 var(--sans);
+    letter-spacing: -0.03em;
+    margin: 0 0 20px;
+    text-wrap: balance;
+  }
+  h1 .thin { color: var(--faint); font-weight: 300; }
+  .lede {
+    max-width: 56ch;
+    font-size: 19px;
+    color: var(--dim);
+    margin: 0 0 28px;
+    text-wrap: pretty;
+  }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 22px;
+    font: 500 12px/1.4 var(--mono); color: var(--faint);
+  }
+  .meta b { color: var(--dim); font-weight: 600; }
+
+  /* sections */
+  section { margin: 0 0 72px; scroll-margin-top: 24px; }
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin: 0 0 22px; }
+  .sec-num { font: 600 11px/1 var(--mono); color: var(--amber); letter-spacing: 0.12em; }
+  h2 {
+    font: 700 13px/1.2 var(--mono);
+    letter-spacing: 0.22em; text-transform: uppercase;
+    margin: 0; color: var(--ink);
+  }
+  .sec-head::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  h3 { font: 650 17px/1.3 var(--sans); margin: 26px 0 8px; }
+  p { margin: 0 0 14px; color: #cfc8ba; }
+  p strong { color: var(--ink); }
+  .muted { color: var(--dim); }
+  .small { font-size: 14px; }
+  code, .tag {
+    font: 500 12px/1 var(--mono);
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 3px 7px; border-radius: 4px; color: var(--dim);
+  }
+
+  /* pitch */
+  .pitch {
+    border-left: 2px solid var(--amber);
+    padding: 4px 0 4px 22px;
+    font-size: 18px; color: #ddd5c6;
+  }
+
+  /* mood board */
+  .palette { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin: 18px 0 8px; }
+  .chip { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--panel); }
+  .chip .swatch { height: 58px; }
+  .chip .name { padding: 8px 10px 2px; font: 600 11px/1.3 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+  .chip .hex { padding: 0 10px 9px; font: 500 11px/1 var(--mono); color: var(--faint); }
+
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 18px 0; }
+  .tile {
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel);
+    padding: 18px 18px 16px;
+    position: relative; overflow: hidden;
+  }
+  .tile .glyph { font-size: 22px; line-height: 1; margin-bottom: 10px; display: block; }
+  .tile h4 { margin: 0 0 6px; font: 650 14px/1.3 var(--sans); }
+  .tile p { margin: 0; font-size: 13.5px; color: var(--dim); }
+  .tile::before {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(135deg, transparent 0 14px, rgba(255,255,255,0.012) 14px 15px);
+    pointer-events: none;
+  }
+  .t-feel { border-top: 2px solid var(--amber); }
+  .t-look { border-top: 2px solid var(--moss); }
+  .t-sound { border-top: 2px solid var(--rust); }
+  .t-touch { border-top: 2px solid var(--salvage); }
+
+  /* pillars */
+  .pillars { display: grid; gap: 12px; }
+  .pillar {
+    display: grid; grid-template-columns: 52px 1fr; gap: 18px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: 18px 20px;
+  }
+  .pillar .n { font: 700 22px/1 var(--mono); color: var(--amber); opacity: 0.9; padding-top: 2px; }
+  .pillar h4 { margin: 0 0 4px; font: 650 15px/1.3 var(--sans); }
+  .pillar p { margin: 0; font-size: 14px; color: var(--dim); }
+
+  /* loop diagram */
+  .loop { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 20px 0 8px; }
+  .loop .node {
+    border: 1px solid var(--line); background: var(--panel);
+    border-radius: 6px; padding: 10px 14px;
+    font: 600 12px/1.2 var(--mono); letter-spacing: 0.04em; color: var(--ink);
+  }
+  .loop .node.hot { border-color: rgba(255,176,74,0.45); color: var(--amber); }
+  .loop .arrow { color: var(--faint); font: 600 14px/1 var(--mono); }
+  .loop-note { font-size: 13.5px; color: var(--dim); margin-top: 12px; }
+
+  /* tables */
+  table { width: 100%; border-collapse: collapse; margin: 16px 0 6px; font-size: 14.5px; }
+  th {
+    text-align: left; font: 600 10.5px/1 var(--mono);
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
+    padding: 0 12px 10px 0; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 11px 12px 11px 0; border-bottom: 1px solid var(--line); vertical-align: top; color: #c8c1b3; }
+  td:first-child { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  td .why { color: var(--dim); font-size: 13px; }
+  tr:last-child td { border-bottom: 0; }
+
+  /* element cards */
+  .elements { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 18px; }
+  .el {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: 16px 18px;
+  }
+  .el h4 { margin: 0 0 6px; font: 650 14px/1.3 var(--sans); display: flex; justify-content: space-between; gap: 10px; }
+  .el h4 .pri { font: 600 10px/1 var(--mono); letter-spacing: 0.1em; color: var(--faint); padding-top: 3px; }
+  .el h4 .pri.core { color: var(--amber); }
+  .el p { margin: 0; font-size: 13.5px; color: var(--dim); }
+
+  /* callout */
+  .note {
+    border: 1px solid var(--line); border-left: 2px solid var(--salvage);
+    background: rgba(127,224,192,0.04); border-radius: 0 8px 8px 0;
+    padding: 16px 20px; margin: 20px 0; font-size: 14.5px; color: #cfc8ba;
+  }
+  .note .lbl { display: block; font: 600 10.5px/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; color: var(--salvage); margin-bottom: 8px; }
+
+  ul.tight { margin: 10px 0 14px; padding-left: 20px; }
+  ul.tight li { margin: 5px 0; color: #c8c1b3; }
+  ul.tight li::marker { color: var(--faint); }
+
+  .questions { counter-reset: q; display: grid; gap: 10px; }
+  .q { display: grid; grid-template-columns: 28px 1fr; gap: 12px; font-size: 14.5px; color: #c8c1b3; }
+  .q::before { counter-increment: q; content: "0" counter(q); font: 600 11px/1.9 var(--mono); color: var(--faint); }
+
+  footer { border-top: 1px solid var(--line); padding-top: 22px; font: 500 12px/1.6 var(--mono); color: var(--faint); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="kicker">Game Design Document · v0.1</p>
+    <h1>LAST MILE<span class="thin"> — a post-apocalyptic delivery roguelike</span></h1>
+    <p class="lede">
+      You are a courier at the end of the world. The outposts that still exist are far apart,
+      the roads are gone, and the only thing anyone still trades is what someone can carry to them.
+      Every run is one expedition: walk out, decide what's worth dying for, reach the beacon.
+    </p>
+    <div class="meta">
+      <span><b>Genre</b> traversal roguelike</span>
+      <span><b>Platform</b> browser (Three.js)</span>
+      <span><b>Camera</b> third-person orbit</span>
+      <span><b>Run length</b> 8–20 min</span>
+      <span><b>Status</b> design</span>
+    </div>
+  </header>
+
+  <!-- 01 PITCH -->
+  <section id="pitch">
+    <div class="sec-head"><span class="sec-num">01</span><h2>Pitch</h2></div>
+    <p class="pitch">
+      A walking game where the walk is the fight. Carry too little and you starve on payout;
+      carry too much and your own legs become the enemy. The world doesn't chase you —
+      it just keeps being bigger than you, and the storm keeps telling you how much time you have.
+    </p>
+    <p class="muted small" style="margin-top:18px">
+      One sentence: <em>Death Stranding's lonely weight-and-terrain walk, compressed into a
+      twenty-minute roguelike run with a shrinking clock.</em>
+    </p>
+  </section>
+
+  <!-- 02 MOOD BOARD -->
+  <section id="mood">
+    <div class="sec-head"><span class="sec-num">02</span><h2>Mood board</h2></div>
+
+    <h3>Palette — overcast, rusted, and one warm light</h3>
+    <div class="palette">
+      <div class="chip"><div class="swatch" style="background:#1d2733"></div><div class="name">Storm slate</div><div class="hex">#1D2733</div></div>
+      <div class="chip"><div class="swatch" style="background:#4a5238"></div><div class="name">Dead moss</div><div class="hex">#4A5238</div></div>
+      <div class="chip"><div class="swatch" style="background:#8a8474"></div><div class="name">Concrete</div><div class="hex">#8A8474</div></div>
+      <div class="chip"><div class="swatch" style="background:#c96f3b"></div><div class="name">Rust</div><div class="hex">#C96F3B</div></div>
+      <div class="chip"><div class="swatch" style="background:#ffb04a"></div><div class="name">Beacon amber</div><div class="hex">#FFB04A</div></div>
+      <div class="chip"><div class="swatch" style="background:#7fe0c0"></div><div class="name">Salvage teal</div><div class="hex">#7FE0C0</div></div>
+    </div>
+    <p class="small muted">
+      Rule: the world is desaturated — mud, moss, concrete, fog. Only two things are allowed
+      saturated colour: <span style="color:var(--amber)">amber</span> (safety, the beacon, your visor)
+      and <span style="color:var(--salvage)">teal</span> (loot). Red is reserved for the hound.
+    </p>
+
+    <h3>Touchstones</h3>
+    <div class="board">
+      <div class="tile t-feel">
+        <span class="glyph">◐</span>
+        <h4>Feel — the weight of a body</h4>
+        <p>Death Stranding's cargo-and-balance anxiety; A Short Hike's small-scale walkability;
+           the Long Dark's sense that weather is an opponent, not a backdrop.</p>
+      </div>
+      <div class="tile t-look">
+        <span class="glyph">▤</span>
+        <h4>Look — quiet apocalypse</h4>
+        <p>Not rubble-porn. Hills that look like they've healed over the ruins. Empty roads.
+           Tall grass moving in wind. One brutalist outpost silo on the horizon.</p>
+      </div>
+      <div class="tile t-sound">
+        <span class="glyph">≋</span>
+        <h4>Sound — wind, boots, metal</h4>
+        <p>Wind as the bed. Footsteps that change with terrain. A low sub-bass swell when the storm
+           turns toward you. No music during the walk; a single rising drone at delivery.</p>
+      </div>
+      <div class="tile t-touch">
+        <span class="glyph">⌁</span>
+        <h4>Touch — honest friction</h4>
+        <p>Turning is slow. Sprinting costs. Landing hurts. Every input is answered by a body
+           that has mass, and every mistake is legible: you can see why you fell.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 03 PILLARS -->
+  <section id="pillars">
+    <div class="sec-head"><span class="sec-num">03</span><h2>Design pillars</h2></div>
+    <div class="pillars">
+      <div class="pillar">
+        <div class="n">01</div>
+        <div><h4>The body is the mechanic</h4>
+        <p>Weight, balance, stamina and footing are the combat system. Nothing attacks you as hard
+           as your own greed does.</p></div>
+      </div>
+      <div class="pillar">
+        <div class="n">02</div>
+        <div><h4>Every meter is readable</h4>
+        <p>If a system can kill you, you can see it: balance sways visibly, cargo sags, the wall's
+           distance is always on screen. No hidden dice.</p></div>
+      </div>
+      <div class="pillar">
+        <div class="n">03</div>
+        <div><h4>Distance is the enemy</h4>
+        <p>Encounters exist to make distance cost something — never to be the point. You lose by
+           running out of road, not by losing a fight.</p></div>
+      </div>
+      <div class="pillar">
+        <div class="n">04</div>
+        <div><h4>Runs are decisions, not dice</h4>
+        <p>Randomised terrain and loot, but the run's shape comes from what you chose to carry,
+           where you chose to cut, and when you chose to rest.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 04 LOOP -->
+  <section id="loop">
+    <div class="sec-head"><span class="sec-num">04</span><h2>Core loop</h2></div>
+    <div class="loop">
+      <span class="node">SURVEY <span style="color:var(--faint)">— see the beacon, read the terrain</span></span>
+      <span class="arrow">→</span>
+      <span class="node">WALK <span style="color:var(--faint)">— spend body, cross ground</span></span>
+      <span class="arrow">→</span>
+      <span class="node hot">LOOT? <span style="color:var(--faint)">— the greed choice</span></span>
+      <span class="arrow">→</span>
+      <span class="node">SURVIVE <span style="color:var(--faint)">— storm, hounds, terrain</span></span>
+      <span class="arrow">→</span>
+      <span class="node">DELIVER <span style="color:var(--faint)">— payout + rating</span></span>
+      <span class="arrow">→</span>
+      <span class="node">UPGRADE <span style="color:var(--faint)">— pick 1 of 3</span></span>
+      <span class="arrow">→</span>
+      <span class="node hot">PUSH FURTHER</span>
+    </div>
+    <p class="loop-note">
+      The loop is deliberately short and the beat between Loot and Survive is where the game lives:
+      every crate is a small bet that the rest of the trip is worth less than the crate.
+      Difficulty rises per delivery — bigger map, faster wall, more hounds — so the bet gets
+      worse exactly as the payout gets better.
+    </p>
+  </section>
+
+  <!-- 05 VERBS -->
+  <section id="verbs">
+    <div class="sec-head"><span class="sec-num">05</span><h2>Verbs</h2></div>
+    <p class="muted small">What the player can actually do. Kept small on purpose — depth comes from combination, not count.</p>
+
+    <table>
+      <thead><tr><th>Movement</th><th>Input</th><th>Cost / consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Walk</td><td>WASD</td><td>Stamina drain scaled by slope, load and water</td></tr>
+        <tr><td>Sprint</td><td>Shift</td><td>1.5× speed, ~2.6× drain, destabilises balance</td></tr>
+        <tr><td>Jump</td><td>Space</td><td>Clears ledges; landing damage scales with fall and cargo</td></tr>
+        <tr><td>Crouch</td><td>C</td><td>Half speed, quiet — hounds sense you at half range</td></tr>
+        <tr><td>Wade</td><td>— (automatic)</td><td>Deep water: 0.55× speed, extra drain, slippery footing</td></tr>
+      </tbody>
+    </table>
+
+    <table>
+      <thead><tr><th>Interaction</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Loot</td><td>Pick up a crate: +payout, +weight, +balance load, +hound noise</td></tr>
+        <tr><td>Drop</td><td>Throw cargo to survive — lose the value, regain the speed</td></tr>
+        <tr><td>Rest</td><td>Stand still to recover stamina; the clock does not stop for you</td></tr>
+        <tr><td>Deliver</td><td>Reach the beacon: payout × condition × contract × combo</td></tr>
+      </tbody>
+    </table>
+
+    <table>
+      <thead><tr><th>Meta (between runs)</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Choose</td><td>One of three upgrades after each delivery</td></tr>
+        <tr><td>Read</td><td>HUD tells you the contract, the wall, the load, the danger</td></tr>
+        <tr><td>Retry</td><td>Permadeath — the run ends, the map resets, you start at the border</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 06 ELEMENTS -->
+  <section id="elements">
+    <div class="sec-head"><span class="sec-num">06</span><h2>Gameplay elements</h2></div>
+    <div class="elements">
+      <div class="el"><h4>Cargo <span class="pri core">CORE</span></h4>
+        <p>Up to N crates on your back. Each adds payout value, slows you, raises balance load and makes you louder. Visible stacked on the walker.</p></div>
+      <div class="el"><h4>Balance &amp; tripping <span class="pri core">CORE</span></h4>
+        <p>A sway meter that falls under load, slope, sprint and water. At zero you trip — drop a crate, take the hit, lose condition. The signature failure.</p></div>
+      <div class="el"><h4>Cargo condition <span class="pri core">CORE</span></h4>
+        <p>Starts at 100%. Falls from falls, hits, storms. Multiplies payout — a perfect walk pays double a battered one.</p></div>
+      <div class="el"><h4>Stamina <span class="pri core">CORE</span></h4>
+        <p>The body's budget. Sprint and climbing spend it, resting returns it, exhaustion locks you out of anything faster than a walk.</p></div>
+      <div class="el"><h4>The storm wall <span class="pri core">CORE</span></h4>
+        <p>A visible, closing weather front. Outrun it or it costs you; it is the run's clock expressed as something you can see coming.</p></div>
+      <div class="el"><h4>Hounds <span class="pri">ENEMY</span></h4>
+        <p>Hunt by noise, not sight. Carry more and they find you sooner. They don't kill you quickly — they cost you cargo and condition.</p></div>
+      <div class="el"><h4>Salvage <span class="pri">LOOT</span></h4>
+        <p>Teal crates scattered in the field. The greed loop: each one you take is a decision to make the rest of the trip harder.</p></div>
+      <div class="el"><h4>Contracts <span class="pri">STRUCTURE</span></h4>
+        <p>Each delivery has a type: Standard, Express (a clock), Fragile (damage halves pay), Heavy Haul (slower, richer).</p></div>
+      <div class="el"><h4>Rating <span class="pri">FEEDBACK</span></h4>
+        <p>S / A / B / C from condition, time and damage taken. The score is the story of how you walked.</p></div>
+      <div class="el"><h4>Upgrades <span class="pri">META</span></h4>
+        <p>Three random offers per delivery from a pool that patches weaknesses: grip, boots, casing, quiet tread, stamina, cargo slots.</p></div>
+      <div class="el"><h4>Terrain <span class="pri">WORLD</span></h4>
+        <p>Endless procedural hills, rivers and ridges, streamed in chunks. Every slope you can see, you can climb — it just costs.</p></div>
+      <div class="el"><h4>Gait telemetry <span class="pri">EXPORT</span></h4>
+        <p>Per-frame joint angles, speed and slope recorded on demand — the walker is modelled on humanoid hardware and its motion is capturable.</p></div>
+    </div>
+  </section>
+
+  <!-- 07 WALKER -->
+  <section id="walker">
+    <div class="sec-head"><span class="sec-num">07</span><h2>The walker</h2></div>
+    <p>
+      The player body is a jointed humanoid — hip, knee, ankle, foot per leg; shoulder and elbow per arm —
+      posed by an analytic gait cycle rather than baked animation. It's parameterised in real units
+      (stride length in metres, cadence in cycles per second, joint angles in radians) around an
+      average adult humanoid platform: <strong>~0.72 m stride, ~1.9 cycles/s at cruise, ~60° peak knee flexion in swing,
+      counter-rotating arm swing.</strong>
+    </p>
+    <p>
+      Because the gait is a function of speed, slope and load, it naturally produces the variation a
+      learning dataset wants: slower and deeper-kneed uphill, shorter stride under cargo, wider sway
+      when unbalanced. Press <code>T</code> in-game to record frames to
+      <code>window.WALKER_TELEMETRY</code> — timestamp, speed, slope and all twelve joint angles.
+    </p>
+    <div class="note">
+      <span class="lbl">Side objective</span>
+      This motion data is intended as a source for humanoid robot policy training. The game itself
+      stays honest: nothing is faked for the dataset — the gait is the same one the player feels,
+      so recorded motion is motion a human actually drove.
+    </div>
+  </section>
+
+  <!-- 08 PROGRESSION -->
+  <section id="progression">
+    <div class="sec-head"><span class="sec-num">08</span><h2>Progression &amp; difficulty</h2></div>
+    <table>
+      <thead><tr><th>Delivery</th><th>What changes</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>1–2</td><td>Short distances, one hound, small storm</td><td>Teach the body: weight, slope, stamina</td></tr>
+        <tr><td>3–5</td><td>Longer legs, contract variety, second hound</td><td>Introduce the greed decision with real stakes</td></tr>
+        <tr><td>6–10</td><td>Faster wall, more storms, deeper water</td><td>Force route choices — the straight line stops being viable</td></tr>
+        <tr><td>11+</td><td>Hound packs, scarce beacons, brutal terrain</td><td>Endgame is a war of attrition against your own greed</td></tr>
+      </tbody>
+    </table>
+    <p class="muted small" style="margin-top:14px">
+      No permanent upgrades between runs in v1 — the skill you build is knowing when to stop carrying.
+      Meta-progression, if added, should be cosmetic or contract unlocks, never power.
+    </p>
+  </section>
+
+  <!-- 09 UI -->
+  <section id="ui">
+    <div class="sec-head"><span class="sec-num">09</span><h2>Interface principles</h2></div>
+    <ul class="tight">
+      <li><strong>All UI is drawn in canvas</strong> — no HTML overlays. HUD, menus, upgrade picks and death screen share the render surface.</li>
+      <li><strong>Left: the body.</strong> Hull, stamina, balance, boots, cargo count and condition — always in the same place.</li>
+      <li><strong>Right: the run.</strong> Score, deliveries, combo streak.</li>
+      <li><strong>Top centre: the world.</strong> Compass to the beacon, distance in metres, hound bearings on the same ring.</li>
+      <li><strong>Nothing modal during play.</strong> Messages fade; the upgrade picker is the only pause.</li>
+    </ul>
+  </section>
+
+  <!-- 10 TECH -->
+  <section id="tech">
+    <div class="sec-head"><span class="sec-num">10</span><h2>Tech &amp; v1 scope</h2></div>
+    <p>
+      Single-file Three.js game, static-hosted (GitHub → Cloudflare Pages). Chunked terrain generated
+      from an analytic height field so the walker's feet and the ground can never disagree.
+      Audio is synthesised at runtime — no assets. No build step.
+    </p>
+    <h3>In v1</h3>
+    <ul class="tight">
+      <li>Endless terrain, water, storms, hounds, salvage, four contract types</li>
+      <li>Balance/trip, cargo condition, boot wear, stamina, crouch</li>
+      <li>S/A/B/C rating, 12+ upgrades, permadeath with session best</li>
+      <li>Canvas HUD, synth audio, gait telemetry export</li>
+    </ul>
+    <h3>Deliberately out of v1</h3>
+    <ul class="tight">
+      <li>Online structures, likes or any social layer</li>
+      <li>Vehicles, NPCs, dialogue, story beats</li>
+      <li>Permanent meta-progression</li>
+    </ul>
+  </section>
+
+  <!-- 11 OPEN QUESTIONS -->
+  <section id="open">
+    <div class="sec-head"><span class="sec-num">11</span><h2>Open questions</h2></div>
+    <div class="questions">
+      <div class="q">Is the storm wall better as a hard boundary (death) or a soft one (drain)? Soft feels fairer; hard creates real urgency.</div>
+      <div class="q">Should dropping cargo be free, or cost a beat of vulnerability? Free makes the greed choice crisper; a beat makes it tense.</div>
+      <div class="q">Does the walker need a visible "stagger" animation at low balance, or is the sway enough signal?</div>
+      <div class="q">How much of the map should be visible from the beacon's height — is the beacon a landmark you can always see, or a compass only?</div>
+      <div class="q">Do hounds ever become a fight you can win, or are they purely a tax? Purely a tax is more honest to the pillars.</div>
+    </div>
+  </section>
+
+  <footer>
+    LAST MILE · design doc v0.1 · post-apocalyptic delivery roguelike · built with Three.js
+  </footer>
+
+</div>
+</body>
+</html>

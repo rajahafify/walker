@@ -58,7 +58,7 @@ function fbm(x, y) {
   return s / norm;
 }
 function angleLerp(a, b, t) {
-  let d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
+  const d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
   return a + d * t;
 }
 
@@ -82,7 +82,13 @@ const CFG = {
   chunkSize: 45,
   chunkSeg: 11,        // vertices per side
   viewChunks: 2,       // radius -> 5x5 chunks = 225 units
-  eyeHeight: 1.62,
+};
+
+const PALETTE = {
+  fog: 0x1d2733,
+  zenith: 0x0b1422,
+  horizon: 0x33414f,
+  sun: 0xffd7a8,
 };
 
 // ---------- renderer / scene ----------
@@ -91,20 +97,72 @@ const uiCanvas = document.getElementById('ui');
 const uctx = uiCanvas.getContext('2d');
 
 const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true });
-renderer.setClearColor(0x0b1016);
+renderer.setClearColor(PALETTE.fog);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.08;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b1016);
-scene.fog = new THREE.FogExp2(0x0b1016, 0.026);
+scene.background = new THREE.Color(PALETTE.fog);
+scene.fog = new THREE.FogExp2(PALETTE.fog, 0.018);
 
-const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 400);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
 
-const hemi = new THREE.HemisphereLight(0x8fb2d8, 0x2a2a22, 1.05);
+// ---------- sky ----------
+let sky;
+{
+  const skyGeo = new THREE.SphereGeometry(360, 24, 12);
+  const pos = skyGeo.attributes.position;
+  const cols = new Float32Array(pos.count * 3);
+  const top = new THREE.Color(PALETTE.zenith), hor = new THREE.Color(PALETTE.horizon);
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const t = clamp((pos.getY(i) / 360 + 0.1) / 0.9, 0, 1);
+    c.copy(hor).lerp(top, Math.pow(t, 0.65));
+    cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+  }
+  skyGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  sky = new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }));
+  sky.renderOrder = -1;
+  scene.add(sky);
+}
+
+// sun disc, drawn as an additive sprite from a canvas texture
+function makeSunTexture() {
+  const s = 256;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = s;
+  const ctx = cv.getContext('2d');
+  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  g.addColorStop(0, 'rgba(255,238,210,1)');
+  g.addColorStop(0.18, 'rgba(255,220,170,0.9)');
+  g.addColorStop(0.4, 'rgba(255,180,120,0.25)');
+  g.addColorStop(1, 'rgba(255,160,90,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  return new THREE.CanvasTexture(cv);
+}
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeSunTexture(), blending: THREE.AdditiveBlending, depthWrite: false, fog: false, transparent: true,
+}));
+sunSprite.scale.set(150, 150, 1);
+scene.add(sunSprite);
+
+// ---------- lights ----------
+const hemi = new THREE.HemisphereLight(0x9db8d8, 0x2c2a20, 0.85);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xffe2b8, 1.7);
-sun.position.set(40, 60, 20);
+const sun = new THREE.DirectionalLight(PALETTE.sun, 2.3);
+sun.position.set(30, 45, 18);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -42; sun.shadow.camera.right = 42;
+sun.shadow.camera.top = 42; sun.shadow.camera.bottom = -42;
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 140;
+sun.shadow.bias = -0.0006;
 scene.add(sun);
-const rim = new THREE.DirectionalLight(0x5f7fff, 0.5);
+scene.add(sun.target);
+const rim = new THREE.DirectionalLight(0x5f7fff, 0.45);
 rim.position.set(-30, 20, -40);
 scene.add(rim);
 
@@ -112,22 +170,19 @@ scene.add(rim);
 // analytic height field: the visual mesh is a sampled version of this,
 // so the walker's feet and the ground always agree.
 function WALK(x, z) {
-  const base = 4.6 * (fbm(x * 0.011 + 11.3, z * 0.011 - 4.7) - 0.5);
-  const roll = 1.15 * Math.sin(x * 0.013) * Math.cos(z * 0.017);
-  const fine = 0.45 * (vnoise(x * 0.06, z * 0.06) - 0.5);
+  const base = 5.4 * (fbm(x * 0.011 + 11.3, z * 0.011 - 4.7) - 0.5);
+  const roll = 1.3 * Math.sin(x * 0.013) * Math.cos(z * 0.017);
+  const fine = 0.5 * (vnoise(x * 0.06, z * 0.06) - 0.5);
   return base + roll + fine;
 }
-function groundNormal(x, z, e = 0.6) {
-  const hL = WALK(x - e, z), hR = WALK(x + e, z);
-  const hD = WALK(x, z - e), hU = WALK(x, z + e);
-  return new THREE.Vector3(hL - hR, 2 * e, hD - hU).normalize();
-}
 
-const chunks = new Map(); // key -> { mesh, props, key }
+const chunks = new Map();
 const rockGeo = new THREE.IcosahedronGeometry(1, 0);
-const rockMat = new THREE.MeshStandardMaterial({ color: 0x3b4038, roughness: 1, flatShading: true });
-const tuftGeo = new THREE.ConeGeometry(0.14, 0.75, 4);
-const tuftMat = new THREE.MeshStandardMaterial({ color: 0x27452f, roughness: 1, flatShading: true });
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x4a4a42, roughness: 1, flatShading: true });
+const trunkGeo = new THREE.CylinderGeometry(0.07, 0.11, 1.6, 5);
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x2e2721, roughness: 1 });
+const crownGeo = new THREE.IcosahedronGeometry(0.85, 0);
+const crownMat = new THREE.MeshStandardMaterial({ color: 0x2c4430, roughness: 1, flatShading: true });
 const salvageList = [];
 
 function chunkKey(ci, cj) { return ci + ',' + cj; }
@@ -148,27 +203,34 @@ function buildChunk(ci, cj) {
   pos.needsUpdate = true;
   geo.computeVertexNormals();
 
+  const nrm = geo.attributes.normal;
   const colors = new Float32Array(pos.count * 3);
-  const cLow = [0.10, 0.17, 0.15], cMid = [0.26, 0.30, 0.22], cHigh = [0.52, 0.50, 0.38];
+  const cLow = new THREE.Color(0x1d2a22), cMid = new THREE.Color(0x4a5238), cHigh = new THREE.Color(0x8a8474);
+  const cRock = new THREE.Color(0x5c574c);
+  const c = new THREE.Color();
   for (let k = 0; k < pos.count; k++) {
-    const t = clamp((pos.getY(k) + 3.4) / 6.8, 0, 1);
-    const c = t < 0.5
-      ? [lerp(cLow[0], cMid[0], t * 2), lerp(cLow[1], cMid[1], t * 2), lerp(cLow[2], cMid[2], t * 2)]
-      : [lerp(cMid[0], cHigh[0], (t - 0.5) * 2), lerp(cMid[1], cHigh[1], (t - 0.5) * 2), lerp(cMid[2], cHigh[2], (t - 0.5) * 2)];
-    colors[k * 3] = c[0]; colors[k * 3 + 1] = c[1]; colors[k * 3 + 2] = c[2];
+    const t = clamp((pos.getY(k) + 3.6) / 7.2, 0, 1);
+    if (t < 0.5) c.copy(cLow).lerp(cMid, t * 2);
+    else c.copy(cMid).lerp(cHigh, (t - 0.5) * 2);
+    const slope = 1 - clamp(nrm.getY(k), 0, 1);
+    c.lerp(cRock, clamp((slope - 0.18) * 2.6, 0, 0.85));
+    colors[k * 3] = c.r; colors[k * 3 + 1] = c.g; colors[k * 3 + 2] = c.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
   const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.96, metalness: 0.0 });
   const mesh = new THREE.Mesh(geo, mat);
+  mesh.receiveShadow = true;
   scene.add(mesh);
 
   // deterministic scattered props
   const key = chunkKey(ci, cj);
   const rnd = mulberry32((Math.imul(ci, 73856093) ^ Math.imul(cj, 19349663) ^ 0x9e3779b9) | 0);
   const props = new THREE.Group();
-  const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 5);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(), p = new THREE.Vector3();
+
+  const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 5);
+  rocks.castShadow = true; rocks.receiveShadow = true;
   for (let i = 0; i < 5; i++) {
     const x = ox + (rnd() - 0.5) * size, z = oz + (rnd() - 0.5) * size;
     const s = 0.25 + rnd() * 0.9;
@@ -180,17 +242,21 @@ function buildChunk(ci, cj) {
   rocks.instanceMatrix.needsUpdate = true;
   props.add(rocks);
 
-  const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, 24);
-  for (let i = 0; i < 24; i++) {
+  const trees = new THREE.InstancedMesh(trunkGeo, trunkMat, 4);
+  const crowns = new THREE.InstancedMesh(crownGeo, crownMat, 4);
+  trees.castShadow = true; crowns.castShadow = true;
+  for (let i = 0; i < 4; i++) {
     const x = ox + (rnd() - 0.5) * size, z = oz + (rnd() - 0.5) * size;
-    const s = 0.6 + rnd() * 0.9;
-    p.set(x, WALK(x, z) + 0.25 * s, z);
-    q.setFromEuler(new THREE.Euler((rnd() - 0.5) * 0.3, rnd() * 6, (rnd() - 0.5) * 0.3));
-    sc.set(s, s, s);
-    tufts.setMatrixAt(i, m4.compose(p, q, sc));
+    const gy = WALK(x, z);
+    const s = 0.7 + rnd() * 0.8;
+    p.set(x, gy + 0.8 * s, z); q.setFromEuler(new THREE.Euler(0, rnd() * 6, 0)); sc.set(s, s, s);
+    trees.setMatrixAt(i, m4.compose(p, q, sc));
+    p.set(x, gy + 1.85 * s, z); sc.set(s, s * 1.15, s);
+    crowns.setMatrixAt(i, m4.compose(p, q, sc));
   }
-  tufts.instanceMatrix.needsUpdate = true;
-  props.add(tufts);
+  trees.instanceMatrix.needsUpdate = true;
+  crowns.instanceMatrix.needsUpdate = true;
+  props.add(trees, crowns);
   scene.add(props);
 
   // occasional supply crate
@@ -235,11 +301,105 @@ function updateChunks(px, pz) {
   for (const k of [...chunks.keys()]) if (!wanted.has(k)) removeChunk(k);
 }
 
+// ---------- dust ----------
+const DUST_N = 200;
+const dustGeo = new THREE.BufferGeometry();
+const dustPos = new Float32Array(DUST_N * 3);
+const dustCol = new Float32Array(DUST_N * 3);
+const dustVel = new Float32Array(DUST_N * 3);
+const dustLife = new Float32Array(DUST_N);
+dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3).setUsage(THREE.DynamicDrawUsage));
+dustGeo.setAttribute('color', new THREE.BufferAttribute(dustCol, 3).setUsage(THREE.DynamicDrawUsage));
+const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+  size: 0.14, vertexColors: true, transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending,
+}));
+dust.frustumCulled = false;
+scene.add(dust);
+let dustHead = 0;
+function emitDust(x, y, z, n = 5) {
+  for (let i = 0; i < n; i++) {
+    const k = dustHead++ % DUST_N;
+    dustPos[k * 3] = x + rand(0.22, -0.22);
+    dustPos[k * 3 + 1] = y + rand(0.08, 0);
+    dustPos[k * 3 + 2] = z + rand(0.22, -0.22);
+    dustVel[k * 3] = rand(0.6, -0.6);
+    dustVel[k * 3 + 1] = rand(0.9, 0.3);
+    dustVel[k * 3 + 2] = rand(0.6, -0.6);
+    dustLife[k] = 0.7;
+  }
+}
+function updateDust(dt) {
+  for (let k = 0; k < DUST_N; k++) {
+    if (dustLife[k] <= 0) {
+      dustCol[k * 3] = dustCol[k * 3 + 1] = dustCol[k * 3 + 2] = 0;
+      continue;
+    }
+    dustLife[k] -= dt;
+    dustPos[k * 3] += dustVel[k * 3] * dt;
+    dustPos[k * 3 + 1] += dustVel[k * 3 + 1] * dt;
+    dustPos[k * 3 + 2] += dustVel[k * 3 + 2] * dt;
+    dustVel[k * 3 + 1] -= 2.2 * dt;
+    const a = clamp(dustLife[k] / 0.7, 0, 1);
+    dustCol[k * 3] = 0.52 * a; dustCol[k * 3 + 1] = 0.45 * a; dustCol[k * 3 + 2] = 0.34 * a;
+  }
+  dustGeo.attributes.position.needsUpdate = true;
+  dustGeo.attributes.color.needsUpdate = true;
+}
+
+// ---------- audio (WebAudio synth, no assets) ----------
+const audio = {
+  ctx: null,
+  init() {
+    if (this.ctx) return;
+    try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { /* silent */ }
+  },
+  env(dur, vol) {
+    const c = this.ctx; if (!c) return null;
+    const g = c.createGain();
+    g.gain.setValueAtTime(vol, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    g.connect(c.destination);
+    return g;
+  },
+  tone(freq, dur, type = 'sine', vol = 0.12, endFreq = null) {
+    const c = this.ctx; if (!c) return;
+    const g = this.env(dur, vol); if (!g) return;
+    const o = c.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, c.currentTime);
+    if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, c.currentTime + dur);
+    o.connect(g); o.start(); o.stop(c.currentTime + dur);
+  },
+  noise(dur, vol = 0.06, cutoff = 600) {
+    const c = this.ctx; if (!c) return;
+    const len = Math.max(1, Math.floor(c.sampleRate * dur));
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = c.createBufferSource(); src.buffer = buf;
+    const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff;
+    const g = this.env(dur, vol); if (!g) return;
+    src.connect(f); f.connect(g); src.start();
+  },
+};
+const sfx = {
+  step() { audio.noise(0.07, 0.045, 320 + Math.random() * 260); },
+  jump() { audio.tone(180, 0.16, 'triangle', 0.07, 330); },
+  land() { audio.noise(0.1, 0.07, 260); },
+  pick() { audio.tone(660, 0.09, 'square', 0.045); setTimeout(() => audio.tone(990, 0.12, 'square', 0.045), 80); },
+  deliver() { [523, 659, 784].forEach((f, i) => setTimeout(() => audio.tone(f, 0.32, 'sine', 0.08), i * 90)); },
+  hit() { audio.tone(92, 0.25, 'sawtooth', 0.13, 38); audio.noise(0.16, 0.1, 220); },
+  perk() { [440, 554, 659].forEach((f, i) => setTimeout(() => audio.tone(f, 0.16, 'triangle', 0.06), i * 70)); },
+  fail() { audio.tone(220, 0.42, 'sawtooth', 0.07, 108); },
+  hunter() { audio.tone(140, 0.3, 'square', 0.03, 90); },
+};
+
 // ---------- walker ----------
 function makeWalker() {
-  const shell = new THREE.MeshStandardMaterial({ color: 0xd2d6d2, roughness: 0.5, metalness: 0.2 });
-  const dark = new THREE.MeshStandardMaterial({ color: 0x2a2f36, roughness: 0.8, metalness: 0.25 });
-  const glow = new THREE.MeshStandardMaterial({ color: 0xffa04d, emissive: 0xff6a00, emissiveIntensity: 1.4, roughness: 0.4 });
+  const shell = new THREE.MeshStandardMaterial({ color: 0xd4d6cf, roughness: 0.45, metalness: 0.25 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x23262b, roughness: 0.75, metalness: 0.3 });
+  const glow = new THREE.MeshStandardMaterial({ color: 0xffa04d, emissive: 0xff6a00, emissiveIntensity: 1.6, roughness: 0.4 });
+  const jointMat = new THREE.MeshStandardMaterial({ color: 0x3a3f46, roughness: 0.4, metalness: 0.6 });
   const J = {};
   const root = new THREE.Group();
 
@@ -250,13 +410,15 @@ function makeWalker() {
   const torso = new THREE.Group(); torso.position.y = 0.09; hips.add(torso); J.torso = torso;
   const chest = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.44, 0.26), shell);
   chest.position.y = 0.24; torso.add(chest);
+  const accent = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.02, 0.015), glow);
+  accent.position.set(0, 0.34, 0.135); torso.add(accent);
   const pack = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.30, 0.16), dark);
   pack.position.set(0, 0.26, -0.2); torso.add(pack);
 
   const cargoBoxes = [];
   for (let i = 0; i < 4; i++) {
     const b = new THREE.Mesh(new THREE.BoxGeometry(0.28 - i * 0.02, 0.09, 0.13), glow);
-    b.position.set(0, 0.44 + i * 0.1, -0.21);
+    b.position.set(0, 0.46 + i * 0.1, -0.21);
     b.visible = false;
     torso.add(b);
     cargoBoxes.push(b);
@@ -267,15 +429,21 @@ function makeWalker() {
   head.position.y = 0.12; neck.add(head);
   const visor = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.045, 0.02), glow);
   visor.position.set(0, 0.13, 0.115); neck.add(visor);
+  const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.26, 3), jointMat);
+  antenna.position.set(0.07, 0.34, -0.06); neck.add(antenna);
 
   // legs: hip -> thigh -> knee -> shin -> ankle -> foot
   for (const s of [-1, 1]) {
     const hip = new THREE.Group(); hip.position.set(0.11 * s, -0.05, 0); hips.add(hip);
     const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.46, 0.15), shell);
     thigh.position.y = -0.23; hip.add(thigh);
+    const kneeBall = new THREE.Mesh(new THREE.SphereGeometry(0.062, 8, 6), jointMat);
+    kneeBall.position.y = -0.46; hip.add(kneeBall);
     const knee = new THREE.Group(); knee.position.y = -0.46; hip.add(knee);
     const shin = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.44, 0.12), dark);
     shin.position.y = -0.22; knee.add(shin);
+    const shinGlow = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.3, 0.012), glow);
+    shinGlow.position.set(0, -0.2, 0.062); knee.add(shinGlow);
     const ankle = new THREE.Group(); ankle.position.y = -0.44; knee.add(ankle);
     const foot = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.07, 0.26), shell);
     foot.position.set(0, -0.035, 0.06); ankle.add(foot);
@@ -294,6 +462,7 @@ function makeWalker() {
     J['sh' + nm] = sh; J['el' + nm] = el;
   }
 
+  root.traverse((o) => { if (o.isMesh) o.castShadow = true; });
   root.userData = { J, cargoBoxes };
   return root;
 }
@@ -304,8 +473,8 @@ const J = walker.userData.J;
 
 // ---------- player ----------
 const player = {
-  x: 0, z: 0, y: 0, yaw: 0, speed: 0, phase: 0,
-  hp: 100, stamina: 100, cargo: 0,
+  x: 0, z: 0, y: 0, vy: 0, grounded: true, yaw: 0, speed: 0, phase: 0,
+  hp: 100, stamina: 100, cargo: 0, sprinting: false, hurtCd: 0, prevSin: 0,
 };
 
 const stats = {};
@@ -313,11 +482,12 @@ function resetStats() {
   Object.assign(stats, {
     speedMul: 1, maxCargo: 3, cargoDrag: 1, maxStamina: 100, stamRegen: 1,
     stamDrain: 1, slopeResist: 0, scoreMul: 1, stormResist: 1, scanRange: 14,
+    sprintCost: 1, hunterAggro: 1, hunterDamage: 1, dropCargo: true,
   });
 }
 resetStats();
 
-const run = { score: 0, deliveries: 0, time: 0 };
+const run = { score: 0, deliveries: 0, time: 0, streak: 0, best: 0 };
 let gameState = 'title'; // title | play | perk | dead
 let perkOffers = [];
 let message = { text: '', sub: '', t: 0 };
@@ -325,9 +495,9 @@ let message = { text: '', sub: '', t: 0 };
 function say(text, sub = '', dur = 2.6) { message = { text, sub, t: dur }; }
 
 // ---------- camera orbit ----------
-const cam = { yaw: Math.PI, pitch: 0.22, dist: 7.2, pos: new THREE.Vector3(0, 6, 10) };
+const cam = { yaw: Math.PI, pitch: 0.24, dist: 6.6, pos: new THREE.Vector3(0, 5, 9) };
 
-// ---------- delivery beacon ----------
+// ---------- beacon + contract ----------
 const beaconGroup = new THREE.Group();
 scene.add(beaconGroup);
 const beam = new THREE.Mesh(
@@ -345,6 +515,13 @@ ring2.rotation.x = -Math.PI / 2;
 beaconGroup.add(ring2);
 
 const delivery = { x: 200, z: 0 };
+const CONTRACT_TYPES = [
+  { id: 'standard', name: 'STANDARD FREIGHT', desc: 'Deliver the cargo.', mult: 1 },
+  { id: 'express', name: 'EXPRESS — BEAT THE CLOCK', desc: 'Late delivery voids the run bonus.', mult: 1.4 },
+  { id: 'fragile', name: 'FRAGILE — HANDLE WITH CARE', desc: 'Any damage halves the payout.', mult: 1.6 },
+  { id: 'heavy', name: 'HEAVY HAUL', desc: 'Slow going, but it pays.', mult: 1.5 },
+];
+let contract = null;
 
 function placeDelivery() {
   const d = 165 + Math.min(260, run.deliveries * 22);
@@ -352,14 +529,23 @@ function placeDelivery() {
   delivery.x = player.x + Math.sin(a) * d;
   delivery.z = player.z + Math.cos(a) * d;
   beaconGroup.position.set(delivery.x, WALK(delivery.x, delivery.z), delivery.z);
+
+  const type = CONTRACT_TYPES[Math.floor(rand(CONTRACT_TYPES.length))];
+  const dist = dist2(player.x, player.z, delivery.x, delivery.z);
+  contract = { ...type, dist, damaged: false, total: 0, timeLeft: 0 };
+  if (type.id === 'express') {
+    contract.total = Math.max(28, dist / 5.2);
+    contract.timeLeft = contract.total;
+  }
 }
 
 // ---------- salvage ----------
 const salvageGeo = new THREE.BoxGeometry(0.5, 0.5, 0.5);
-const salvageMat = new THREE.MeshStandardMaterial({ color: 0x7fe0c0, emissive: 0x0d5c46, emissiveIntensity: 1.2, roughness: 0.4 });
+const salvageMat = new THREE.MeshStandardMaterial({ color: 0x7fe0c0, emissive: 0x0d5c46, emissiveIntensity: 1.3, roughness: 0.4 });
 function makeSalvage(x, y, z) {
   const m = new THREE.Mesh(salvageGeo, salvageMat);
   m.position.set(x, y + 0.6, z);
+  m.castShadow = true;
   scene.add(m);
   return { mesh: m, x, z, taken: false, key: null };
 }
@@ -367,41 +553,83 @@ function makeSalvage(x, y, z) {
 // ---------- storms ----------
 const storms = [];
 const stormGeo = new THREE.BufferGeometry();
+const STORM_PTS = 700;
 {
-  const N = 900, pts = new Float32Array(N * 3);
-  for (let i = 0; i < N; i++) {
+  const pts = new Float32Array(STORM_PTS * 3);
+  for (let i = 0; i < STORM_PTS; i++) {
     const a = rand(TAU), r = Math.sqrt(rand(1)) * 34, y = rand(14);
     pts[i * 3] = Math.cos(a) * r; pts[i * 3 + 1] = y; pts[i * 3 + 2] = Math.sin(a) * r;
   }
-  stormGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+  stormGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3).setUsage(THREE.DynamicDrawUsage));
 }
-const stormMat = new THREE.PointsMaterial({ color: 0x9aa6b8, size: 0.22, transparent: true, opacity: 0.55, depthWrite: false });
+const stormMat = new THREE.PointsMaterial({ color: 0x9aa6b8, size: 0.2, transparent: true, opacity: 0.5, depthWrite: false });
 
 function relocateStorm(s) {
-  const a = rand(TAU), d = 180 + rand(220);
+  const a = rand(TAU), d = 190 + rand(220);
   s.x = player.x + Math.sin(a) * d;
   s.z = player.z + Math.cos(a) * d;
   s.radius = 34 + rand(18);
   s.points.position.set(s.x, WALK(s.x, s.z), s.z);
 }
-for (let i = 0; i < 4; i++) {
-  const s = { x: 0, z: 0, radius: 40, points: new THREE.Points(stormGeo, stormMat) };
-  relocateStorm(s);
-  scene.add(s.points);
-  storms.push(s);
+function ensureStorms(n) {
+  while (storms.length < n) {
+    const s = { x: 0, z: 0, radius: 40, points: new THREE.Points(stormGeo, stormMat) };
+    relocateStorm(s);
+    scene.add(s.points);
+    storms.push(s);
+  }
+}
+
+// ---------- hounds (hunters) ----------
+const hounds = [];
+const houndMat = new THREE.MeshStandardMaterial({ color: 0x1a1d22, emissive: 0xff2a2a, emissiveIntensity: 1.5, roughness: 0.35, metalness: 0.4 });
+const houndRingMat = new THREE.MeshBasicMaterial({ color: 0xff3a3a, transparent: true, opacity: 0.6 });
+function makeHound() {
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.48, 0), houndMat);
+  g.add(core);
+  const ringM = new THREE.Mesh(new THREE.TorusGeometry(0.82, 0.035, 6, 26), houndRingMat);
+  ringM.rotation.x = Math.PI / 2;
+  g.add(ringM);
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({ color: 0xff6a4a }));
+  eye.position.z = 0.42;
+  g.add(eye);
+  g.userData = { core, ring: ringM, home: { x: 0, z: 0 }, bob: rand(TAU), cooldown: 0 };
+  scene.add(g);
+  return g;
+}
+function ensureHounds(n) {
+  while (hounds.length < n) {
+    const h = makeHound();
+    const a = rand(TAU), d = 60 + rand(60);
+    h.userData.home = { x: player.x + Math.sin(a) * d, z: player.z + Math.cos(a) * d };
+    h.position.set(h.userData.home.x, 0, h.userData.home.z);
+    hounds.push(h);
+  }
+  while (hounds.length > n) scene.remove(hounds.pop());
 }
 
 // ---------- input ----------
 const keys = new Set();
+let jumpQueued = false;
 addEventListener('keydown', (e) => {
+  audio.init();
   keys.add(e.code);
-  if (e.code === 'Enter' || e.code === 'Space') {
+  if (e.code === 'Enter' || (e.code === 'Space' && gameState !== 'play')) {
     if (gameState === 'title') startRun();
     else if (gameState === 'dead') startRun();
   }
+  if (e.code === 'Space' && gameState === 'play') jumpQueued = true;
   if (gameState === 'perk' && /^Digit[123]$/.test(e.code)) {
     const i = +e.code.slice(5) - 1;
-    if (perkOffers[i]) { perkOffers[i].apply(); say(perkOffers[i].name, perkOffers[i].desc, 2.2); perkOffers = []; gameState = 'play'; placeDelivery(); }
+    if (perkOffers[i]) {
+      perkOffers[i].apply();
+      sfx.perk();
+      say(perkOffers[i].name, perkOffers[i].desc, 2.2);
+      perkOffers = [];
+      gameState = 'play';
+      placeDelivery();
+    }
   }
   if (e.code === 'KeyT' && gameState === 'play') { telemetry.on = !telemetry.on; say(telemetry.on ? 'TELEMETRY ON' : 'TELEMETRY OFF'); }
   if (['ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
@@ -409,12 +637,12 @@ addEventListener('keydown', (e) => {
 addEventListener('keyup', (e) => keys.delete(e.code));
 
 let dragging = false, lastX = 0, lastY = 0;
-glCanvas.addEventListener('pointerdown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+glCanvas.addEventListener('pointerdown', (e) => { audio.init(); dragging = true; lastX = e.clientX; lastY = e.clientY; });
 addEventListener('pointerup', () => (dragging = false));
 addEventListener('pointermove', (e) => {
   if (!dragging) return;
   cam.yaw -= (e.clientX - lastX) * 0.006;
-  cam.pitch = clamp(cam.pitch + (e.clientY - lastY) * 0.004, -0.15, 0.95);
+  cam.pitch = clamp(cam.pitch + (e.clientY - lastY) * 0.004, -0.12, 0.95);
   lastX = e.clientX; lastY = e.clientY;
 });
 addEventListener('wheel', (e) => { cam.dist = clamp(cam.dist + e.deltaY * 0.006, 3.5, 14); }, { passive: true });
@@ -439,11 +667,14 @@ const PERK_POOL = [
   { name: 'LONG STRIDE', desc: '+12% walk speed', apply() { stats.speedMul *= 1.12; } },
   { name: 'CARGO FRAME', desc: '+1 cargo slot, lighter load', apply() { stats.maxCargo++; stats.cargoDrag *= 0.8; } },
   { name: 'IRON LUNGS', desc: '+30 stamina, faster recovery', apply() { stats.maxStamina += 30; stats.stamRegen *= 1.3; player.stamina = stats.maxStamina; } },
+  { name: 'SPRINT SERVO', desc: 'Sprint costs 30% less stamina', apply() { stats.sprintCost *= 0.7; } },
   { name: 'GYRO STABILIZER', desc: 'Ignore most slope drag', apply() { stats.slopeResist += 0.4; } },
   { name: 'FIELD REPAIR', desc: 'Restore 35 hull', apply() { player.hp = Math.min(100, player.hp + 35); } },
   { name: 'LIGHT STEPS', desc: '-25% stamina drain', apply() { stats.stamDrain *= 0.75; } },
   { name: 'SALVAGE EYE', desc: '+40% delivery score', apply() { stats.scoreMul *= 1.4; } },
   { name: 'AUX BATTERY', desc: 'Half storm damage', apply() { stats.stormResist *= 0.5; } },
+  { name: 'JAMMER', desc: 'Hounds sense you 30% later', apply() { stats.hunterAggro *= 0.7; } },
+  { name: 'SHOCK ABSORB', desc: 'Hound hits hurt less, no cargo drop', apply() { stats.hunterDamage *= 0.6; stats.dropCargo = false; } },
   { name: 'SCANNER', desc: 'Spot crates from farther', apply() { stats.scanRange += 22; } },
 ];
 
@@ -456,15 +687,32 @@ function offerPerks() {
   gameState = 'perk';
 }
 
+// ---------- damage ----------
+function damage(amount, src) {
+  if (gameState !== 'play') return;
+  player.hp -= amount;
+  player.hurtCd = 0.35;
+  if (contract && contract.id === 'fragile') contract.damaged = true;
+  run.streak = 0;
+  if (src === 'hound') sfx.hit();
+  if (player.hp <= 0) {
+    player.hp = 0;
+    run.best = Math.max(run.best, run.score);
+    gameState = 'dead';
+  }
+}
+
 // ---------- run lifecycle ----------
 function startRun() {
   player.x = 0; player.z = 0; player.yaw = 0; player.speed = 0; player.phase = 0;
-  player.hp = 100; player.cargo = 0;
+  player.hp = 100; player.cargo = 0; player.vy = 0; player.grounded = true;
   resetStats(); player.stamina = stats.maxStamina;
-  run.score = 0; run.deliveries = 0; run.time = 0;
+  run.score = 0; run.deliveries = 0; run.time = 0; run.streak = 0;
   lastChunkI = 1e9; lastChunkJ = 1e9;
   updateChunks(0, 0);
   telemetry.frames = [];
+  ensureStorms(4);
+  ensureHounds(1);
   placeDelivery();
   for (const s of storms) relocateStorm(s);
   gameState = 'play';
@@ -485,8 +733,13 @@ function updatePlayer(dt) {
   const dir = new THREE.Vector3().addScaledVector(f, iz).addScaledVector(r, ix);
   if (moving) dir.normalize();
 
-  const baseSpeed = 3.1 * stats.speedMul;
+  const wantSprint = keys.has('ShiftLeft') || keys.has('ShiftRight');
+  const canSprint = wantSprint && moving && player.stamina > 1 && player.grounded;
+  player.sprinting = canSprint;
+
+  const baseSpeed = 3.1 * stats.speedMul * (canSprint ? 1.5 : 1);
   const cargoPenalty = 1 / (1 + player.cargo * 0.16 * stats.cargoDrag);
+  const contractPenalty = contract && contract.id === 'heavy' ? 0.88 : 1;
   const h = WALK(player.x, player.z);
   const hAhead = WALK(player.x + dir.x * 1.2, player.z + dir.z * 1.2);
   const slope = moving ? (hAhead - h) / 1.2 : 0;
@@ -494,7 +747,7 @@ function updatePlayer(dt) {
   const slopeFactor = clamp(1 - uphill * (0.9 - stats.slopeResist), 0.42, 1.25);
 
   const exhausted = player.stamina <= 0.5;
-  const target = moving && !exhausted ? baseSpeed * cargoPenalty * slopeFactor : 0;
+  const target = moving && !exhausted ? baseSpeed * cargoPenalty * contractPenalty * slopeFactor : 0;
   player.speed = lerp(player.speed, target, 1 - Math.exp(-dt * 7));
 
   if (player.speed > 0.05) {
@@ -503,10 +756,29 @@ function updatePlayer(dt) {
     const wantYaw = Math.atan2(dir.x, dir.z);
     player.yaw = angleLerp(player.yaw, wantYaw, 1 - Math.exp(-dt * 10));
   }
-  player.y = WALK(player.x, player.z);
+
+  // vertical: jump + gravity over the analytic ground
+  const ground = WALK(player.x, player.z);
+  if (jumpQueued && player.grounded) {
+    player.vy = 6.2;
+    player.grounded = false;
+    sfx.jump();
+  }
+  jumpQueued = false;
+  if (!player.grounded) {
+    player.vy -= 20 * dt;
+    player.y += player.vy * dt;
+    if (player.y <= ground) {
+      player.y = ground; player.vy = 0; player.grounded = true;
+      emitDust(player.x, player.y, player.z, 8);
+      sfx.land();
+    }
+  } else {
+    player.y = ground;
+  }
 
   // stamina
-  const effort = moving ? (0.5 + Math.max(0, uphill) * 1.4) : 0;
+  const effort = moving ? (0.5 + Math.max(0, uphill) * 1.4) * (canSprint ? 2.6 : 1) * stats.sprintCost : 0;
   if (moving && !exhausted) player.stamina -= effort * 6.2 * dt * stats.stamDrain;
   else player.stamina += 9 * dt * stats.stamRegen;
   player.stamina = clamp(player.stamina, 0, stats.maxStamina);
@@ -519,13 +791,20 @@ function updatePlayer(dt) {
   if (inStorm) {
     player.stamina = Math.max(0, player.stamina - 14 * dt);
     player.hp -= 2.4 * dt * stats.stormResist;
-    if (player.hp <= 0) { player.hp = 0; gameState = 'dead'; }
+    if (player.hp <= 0) { player.hp = 0; run.best = Math.max(run.best, run.score); gameState = 'dead'; }
   }
+  if (player.hurtCd > 0) player.hurtCd -= dt;
 
-  // gait phase
-  const cadence = GAIT.cadence * clamp(player.speed / 3.1, 0.35, 1.6);
+  // gait phase + footfalls
+  const cadence = GAIT.cadence * clamp(player.speed / 3.1, 0.35, 1.7);
   player.phase += dt * cadence * TAU * (player.speed > 0.05 ? 1 : 0);
-  if (player.speed <= 0.05) player.phase += dt * 0.6; // idle breathing drift
+  if (player.speed <= 0.05) player.phase += dt * 0.6; // idle drift
+  const s = Math.sin(player.phase);
+  if (player.grounded && player.speed > 0.6 && Math.sign(s) !== Math.sign(player.prevSin)) {
+    emitDust(player.x, player.y, player.z, player.sprinting ? 6 : 3);
+    sfx.step();
+  }
+  player.prevSin = s;
 
   recordFrame(slope);
   return inStorm;
@@ -536,25 +815,25 @@ function poseWalker(t, inStorm) {
   const p = player.phase;
   const sw = Math.sin(p), cw = Math.cos(p);
   const amp = clamp(sp, 0, 1);
-  const breeze = inStorm ? 1 : 0;
+  const air = player.grounded ? 0 : 1;
 
-  // legs — hip extension/flexion; knee flexion peaks mid-swing (p ≈ π),
+  // legs — hip extension/flexion; knee flexion peaks mid-swing,
   // plus a small stance-phase flex like a real loading response
-  J.hipL.rotation.x = -GAIT.hipSwing * amp * sw;
-  J.hipR.rotation.x = GAIT.hipSwing * amp * sw;
-  J.kneeL.rotation.x = GAIT.kneePeak * amp * Math.max(0, -cw) + 0.06;
-  J.kneeR.rotation.x = GAIT.kneePeak * amp * Math.max(0, cw) + 0.06;
+  J.hipL.rotation.x = -GAIT.hipSwing * amp * sw - air * 0.5;
+  J.hipR.rotation.x = GAIT.hipSwing * amp * sw - air * 0.2;
+  J.kneeL.rotation.x = GAIT.kneePeak * amp * Math.max(0, -cw) + 0.06 + air * 0.9;
+  J.kneeR.rotation.x = GAIT.kneePeak * amp * Math.max(0, cw) + 0.06 + air * 0.5;
   J.ankleL.rotation.x = -GAIT.ankleSwing * amp * Math.max(0, -sw);
   J.ankleR.rotation.x = -GAIT.ankleSwing * amp * Math.max(0, sw);
 
   // arms counter-swing
-  J.shL.rotation.x = GAIT.armSwing * amp * sw;
-  J.shR.rotation.x = -GAIT.armSwing * amp * sw;
+  J.shL.rotation.x = GAIT.armSwing * amp * sw - air * 0.6;
+  J.shR.rotation.x = -GAIT.armSwing * amp * sw - air * 0.6;
   J.elL.rotation.x = -0.18 - 0.3 * amp;
   J.elR.rotation.x = -0.18 - 0.3 * amp;
 
   // torso: vertical bob, forward lean with speed + cargo, lateral sway
-  const bob = Math.abs(cw) * GAIT.bob * amp;
+  const bob = player.grounded ? Math.abs(cw) * GAIT.bob * amp : 0;
   J.hips.position.y = 1.02 + bob - (player.cargo * 0.012);
   J.torso.rotation.x = GAIT.lean * amp + player.cargo * 0.02 + Math.sin(t * 1.4) * 0.012;
   J.torso.rotation.z = 0.035 * amp * sw;
@@ -563,7 +842,7 @@ function poseWalker(t, inStorm) {
   J.neck.rotation.y = 0.08 * amp * sw;
 
   // storm buffeting
-  if (breeze) {
+  if (inStorm) {
     J.torso.rotation.z += Math.sin(t * 7.3) * 0.05;
     J.torso.rotation.x += Math.sin(t * 5.1) * 0.04;
     J.shL.rotation.z = 0.25 + Math.sin(t * 6) * 0.06;
@@ -577,6 +856,51 @@ function poseWalker(t, inStorm) {
   walker.userData.cargoBoxes.forEach((b, i) => { b.visible = i < player.cargo; });
 }
 
+function updateHounds(dt, t) {
+  const cargoSense = 1 + player.cargo * 0.12;
+  const aggro = 24 * stats.hunterAggro * cargoSense;
+  for (const h of hounds) {
+    const u = h.userData;
+    const d = dist2(h.position.x, h.position.z, player.x, player.z);
+    let tx, tz, spd;
+    if (d < aggro) {
+      tx = player.x; tz = player.z;
+      spd = 2.5;
+      if (d < 16) sfx.hunter();
+    } else {
+      tx = u.home.x; tz = u.home.z;
+      spd = 1.1;
+      if (dist2(h.position.x, h.position.z, u.home.x, u.home.z) < 2) {
+        const a = rand(TAU);
+        u.home.x = clamp(u.home.x + Math.sin(a) * 30, player.x - 150, player.x + 150);
+        u.home.z = clamp(u.home.z + Math.cos(a) * 30, player.z - 150, player.z + 150);
+      }
+    }
+    const dx = tx - h.position.x, dz = tz - h.position.z;
+    const len = Math.hypot(dx, dz) || 1;
+    h.position.x += (dx / len) * spd * dt;
+    h.position.z += (dz / len) * spd * dt;
+    h.position.y = WALK(h.position.x, h.position.z) + 2.0 + Math.sin(t * 2.4 + u.bob) * 0.18;
+    u.core.rotation.y += dt * 2.2;
+    u.core.rotation.x += dt * 1.1;
+    u.ring.rotation.z += dt * 1.6;
+
+    // contact
+    u.cooldown = Math.max(0, u.cooldown - dt);
+    if (d < 1.15 && u.cooldown === 0) {
+      u.cooldown = 1.4;
+      damage(16 * stats.hunterDamage, 'hound');
+      const push = 2.4;
+      player.x += (player.x - h.position.x) / (d || 1) * push;
+      player.z += (player.z - h.position.z) / (d || 1) * push;
+      if (stats.dropCargo && player.cargo > 0) {
+        player.cargo--;
+        say('CARGO LOST', 'The hound tore a crate off your back.', 2);
+      }
+    }
+  }
+}
+
 function updateCamera(dt) {
   const r = Math.cos(cam.pitch) * cam.dist;
   const hgt = Math.sin(cam.pitch) * cam.dist + 1.4;
@@ -588,6 +912,14 @@ function updateCamera(dt) {
   cam.pos.z = lerp(cam.pos.z, tz, 1 - Math.exp(-dt * 6));
   camera.position.copy(cam.pos);
   camera.lookAt(player.x, player.y + 1.25, player.z);
+
+  // sky + sun follow the camera so the horizon never ends
+  sky.position.copy(camera.position);
+  sunSprite.position.copy(camera.position).addScaledVector(new THREE.Vector3(30, 45, 18).normalize(), 300);
+
+  // shadow frustum tracks the player
+  sun.position.set(player.x + 30, player.y + 45, player.z + 18);
+  sun.target.position.set(player.x, player.y, player.z);
 }
 
 function updateWorld(dt, t) {
@@ -598,15 +930,21 @@ function updateWorld(dt, t) {
   ring2.scale.setScalar(1 + Math.sin(t * 2.2 + 1) * 0.08);
   beam.material.opacity = 0.12 + Math.sin(t * 1.7) * 0.04;
 
-  // delivery check
-  if (gameState === 'play' && dist2(player.x, player.z, delivery.x, delivery.z) < 3.2) {
-    run.deliveries++;
-    const gain = Math.round((120 + player.cargo * 30) * stats.scoreMul);
-    run.score += gain;
-    say('DELIVERY COMPLETE', '+' + gain + '  ·  upgrade available', 3);
-    ringMat.color.setHex(0x7fe0c0);
-    setTimeout(() => ringMat.color.setHex(0xffb04a), 400);
-    offerPerks();
+  if (gameState === 'play') {
+    // express timer
+    if (contract && contract.id === 'express') {
+      contract.timeLeft -= dt;
+      if (contract.timeLeft <= 0) {
+        sfx.fail();
+        say('CONTRACT FAILED', 'Too slow. The client reposted it.', 2.6);
+        placeDelivery();
+      }
+    }
+
+    // delivery check
+    if (dist2(player.x, player.z, delivery.x, delivery.z) < 3.2) {
+      completeDelivery();
+    }
   }
 
   // salvage pickup
@@ -614,24 +952,59 @@ function updateWorld(dt, t) {
     if (s.taken) continue;
     s.mesh.rotation.y += dt * 1.4;
     s.mesh.position.y = WALK(s.x, s.z) + 0.6 + Math.sin(t * 2 + s.x) * 0.1;
-    if (dist2(player.x, player.z, s.x, s.z) < 1.7) {
+    if (gameState === 'play' && dist2(player.x, player.z, s.x, s.z) < 1.7) {
       s.taken = true;
       scene.remove(s.mesh);
-      if (player.cargo < stats.maxCargo) { player.cargo++; say('CARGO +1', 'Heavier now. Worth more on delivery.', 1.8); }
-      else { run.score += 30; say('CARGO FULL', '+30 salvage', 1.8); }
+      if (player.cargo < stats.maxCargo) { player.cargo++; sfx.pick(); say('CARGO +1', 'Heavier now. Worth more on delivery.', 1.8); }
+      else { run.score += 30; sfx.pick(); say('CARGO FULL', '+30 salvage', 1.8); }
     }
   }
 
-  // storms drift + relocate
+  // storms drift + rain
+  const rain = stormGeo.attributes.position;
+  for (let i = 0; i < STORM_PTS; i++) {
+    let y = rain.getY(i) - dt * 16;
+    if (y < 0) y += 14;
+    rain.setY(i, y);
+  }
+  rain.needsUpdate = true;
   for (const s of storms) {
     s.points.rotation.y += dt * 0.25;
-    if (dist2(player.x, player.z, s.x, s.z) > 520) relocateStorm(s);
+    if (dist2(player.x, player.z, s.x, s.z) > 560) relocateStorm(s);
   }
+
+  updateHounds(dt, t);
+  updateDust(dt);
+}
+
+function completeDelivery() {
+  const mult = contract.mult * (1 + Math.min(run.streak, 6) * 0.25);
+  let timeBonus = 0;
+  if (contract.id === 'express' && contract.total > 0) timeBonus = clamp(contract.timeLeft / contract.total, 0, 1);
+  const base = 100 + player.cargo * 25 + Math.min(200, contract.dist * 0.15);
+  let gain = Math.round(base * mult * (1 + timeBonus) * stats.scoreMul);
+  let note = contract.name;
+  if (contract.id === 'fragile' && contract.damaged) { gain = Math.round(gain * 0.5); note = 'CARGO COMPROMISED'; }
+  run.score += gain;
+  run.deliveries++;
+  run.streak++;
+  sfx.deliver();
+  say('DELIVERY COMPLETE  +' + gain, note + '  ·  upgrade available', 3);
+  ringMat.color.setHex(0x7fe0c0);
+  setTimeout(() => ringMat.color.setHex(0xffb04a), 400);
+
+  // difficulty ramp
+  ensureStorms(Math.min(8, 4 + Math.floor(run.deliveries / 2)));
+  ensureHounds(Math.min(7, 1 + Math.floor(run.deliveries * 0.8)));
+  if (run.deliveries % 5 === 0) {
+    run.score += 250;
+    say('SECTOR CLEARED', 'Milestone bonus +250', 3);
+  }
+  offerPerks();
 }
 
 // ---------- HUD (canvas 2D, no HTML) ----------
 const FONT = '600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-const FONT_BIG = '700 46px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
 
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -666,17 +1039,18 @@ function drawHUD(t) {
 
   if (gameState === 'title') {
     uctx.textAlign = 'center'; uctx.textBaseline = 'middle';
-    uctx.fillStyle = 'rgba(6,9,13,0.55)'; uctx.fillRect(0, 0, W, H);
-    uctx.font = FONT_BIG;
+    uctx.fillStyle = 'rgba(6,9,13,0.45)'; uctx.fillRect(0, 0, W, H);
+    uctx.font = '700 46px ui-monospace, Menlo, monospace';
     uctx.fillStyle = '#f0f4f8';
-    uctx.fillText('W A L K E R', W / 2, H / 2 - 40);
+    uctx.fillText('W A L K E R', W / 2, H / 2 - 56);
     uctx.font = FONT;
     uctx.fillStyle = 'rgba(180,200,215,0.9)';
-    uctx.fillText('a delivery roguelike — carry, climb, survive, upgrade', W / 2, H / 2 + 8);
+    uctx.fillText('a delivery roguelike — carry, climb, survive, upgrade', W / 2, H / 2 - 8);
+    uctx.fillText('hounds hunt you · storms drain you · every delivery makes you stronger', W / 2, H / 2 + 14);
     uctx.fillStyle = 'rgba(255,176,74,' + (0.55 + Math.sin(t * 3) * 0.35) + ')';
-    uctx.fillText('PRESS ENTER TO ACCEPT YOUR FIRST CONTRACT', W / 2, H / 2 + 56);
+    uctx.fillText('PRESS ENTER TO ACCEPT YOUR FIRST CONTRACT', W / 2, H / 2 + 62);
     uctx.fillStyle = 'rgba(140,160,175,0.75)';
-    uctx.fillText('WASD move   ·   drag to look   ·   wheel zoom', W / 2, H - 60);
+    uctx.fillText('WASD move · SHIFT sprint · SPACE jump · drag to look · wheel zoom', W / 2, H - 52);
     uctx.restore();
     return;
   }
@@ -688,14 +1062,36 @@ function drawHUD(t) {
   uctx.fillStyle = 'rgba(200,215,225,0.8)';
   uctx.fillText('CARGO ' + player.cargo + '/' + stats.maxCargo, 20, 72);
 
+  // --- contract card ---
+  if (contract) {
+    const y = 88;
+    uctx.fillStyle = 'rgba(8,12,17,0.5)';
+    roundRect(uctx, 20, y, 250, contract.id === 'express' ? 52 : 38, 4);
+    uctx.fillStyle = '#ffb04a';
+    uctx.font = '700 11px ui-monospace, Menlo, monospace';
+    uctx.textAlign = 'left';
+    uctx.fillText(contract.name, 30, y + 16);
+    uctx.fillStyle = 'rgba(190,205,218,0.75)';
+    uctx.font = '600 11px ui-monospace, Menlo, monospace';
+    uctx.fillText(contract.desc, 30, y + 30);
+    if (contract.id === 'express') {
+      const frac = clamp(contract.timeLeft / contract.total, 0, 1);
+      bar(uctx, 30, y + 38, 230, 8, frac, frac < 0.3 ? '#ff4d3d' : '#ffb04a', frac < 0.3 ? '#ff8a5a' : '#ffe08a');
+    }
+  }
+
   // --- top right: score ---
   uctx.textAlign = 'right';
   uctx.fillStyle = '#f0f4f8';
-  uctx.font = FONT_BIG.replace('46px', '22px');
+  uctx.font = '700 22px ui-monospace, Menlo, monospace';
   uctx.fillText(String(run.score).padStart(5, '0'), W - 20, 32);
   uctx.font = FONT;
   uctx.fillStyle = 'rgba(160,180,195,0.8)';
   uctx.fillText('DELIVERIES ' + run.deliveries, W - 20, 54);
+  if (run.streak > 0) {
+    uctx.fillStyle = '#7fe0c0';
+    uctx.fillText('COMBO x' + (1 + Math.min(run.streak, 6) * 0.25).toFixed(2), W - 20, 72);
+  }
 
   // --- compass to target ---
   const rel = Math.atan2(delivery.x - player.x, delivery.z - player.z);
@@ -712,6 +1108,17 @@ function drawHUD(t) {
   uctx.beginPath();
   uctx.moveTo(0, -R - 4); uctx.lineTo(-6, -R + 8); uctx.lineTo(6, -R + 8);
   uctx.closePath(); uctx.fill();
+
+  // hound bearings on the same ring
+  for (const h of hounds) {
+    const hd = dist2(h.position.x, h.position.z, player.x, player.z);
+    if (hd > 34) continue;
+    const hb = Math.atan2(h.position.x - player.x, h.position.z - player.z) - camFwd - bearing;
+    uctx.rotate(hb);
+    uctx.fillStyle = 'rgba(255,70,60,' + clamp(1 - hd / 34, 0.2, 1) + ')';
+    uctx.beginPath(); uctx.arc(0, R, 3, 0, TAU); uctx.fill();
+    uctx.rotate(-hb);
+  }
   uctx.restore();
   const d = dist2(player.x, player.z, delivery.x, delivery.z);
   uctx.textAlign = 'center';
@@ -735,10 +1142,15 @@ function drawHUD(t) {
     uctx.globalAlpha = 1;
   }
 
-  // --- storm warning ---
+  // --- atmosphere: vignette + storm tint + danger tint ---
+  const vg = uctx.createRadialGradient(W / 2, H / 2, H * 0.45, W / 2, H / 2, H * 0.95);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.38)');
+  uctx.fillStyle = vg; uctx.fillRect(0, 0, W, H);
+
   const inStorm = storms.some((s) => dist2(player.x, player.z, s.x, s.z) < s.radius);
   if (inStorm) {
-    const a = 0.35 + Math.sin(t * 8) * 0.12;
+    const a = 0.3 + Math.sin(t * 8) * 0.1;
     const g = uctx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.85);
     g.addColorStop(0, 'rgba(90,120,160,0)');
     g.addColorStop(1, 'rgba(90,130,180,' + a + ')');
@@ -749,12 +1161,26 @@ function drawHUD(t) {
     uctx.fillText('STORM — GET OUT OF IT', W / 2, 100);
   }
 
-  // --- low stamina / low hull flashes ---
+  let nearest = 1e9;
+  for (const h of hounds) nearest = Math.min(nearest, dist2(h.position.x, h.position.z, player.x, player.z));
+  if (nearest < 18) {
+    const a = clamp(1 - nearest / 18, 0, 1) * (0.5 + Math.sin(t * 10) * 0.25);
+    const g = uctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.9);
+    g.addColorStop(0, 'rgba(160,20,20,0)');
+    g.addColorStop(1, 'rgba(190,30,25,' + a * 0.5 + ')');
+    uctx.fillStyle = g; uctx.fillRect(0, 0, W, H);
+  }
+
+  // --- low stamina / hurt flash ---
   if (player.stamina < 12) {
     uctx.textAlign = 'center';
     uctx.fillStyle = 'rgba(255,190,120,' + (0.5 + Math.sin(t * 9) * 0.3) + ')';
     uctx.font = FONT;
     uctx.fillText('EXHAUSTED — REST TO RECOVER', W / 2, H - 92);
+  }
+  if (player.hurtCd > 0) {
+    uctx.fillStyle = 'rgba(255,40,30,' + (player.hurtCd * 0.5) + ')';
+    uctx.fillRect(0, 0, W, H);
   }
 
   // --- controls hint (first 12s of a run) ---
@@ -763,7 +1189,7 @@ function drawHUD(t) {
     uctx.textAlign = 'left';
     uctx.fillStyle = 'rgba(170,190,205,0.9)';
     uctx.font = FONT;
-    uctx.fillText('WASD move · drag look · wheel zoom · T telemetry', 20, H - 24);
+    uctx.fillText('WASD move · SHIFT sprint · SPACE jump · drag look · wheel zoom · T telemetry', 20, H - 24);
     uctx.globalAlpha = 1;
   }
 
@@ -797,12 +1223,14 @@ function drawHUD(t) {
     uctx.textAlign = 'center';
     uctx.fillStyle = '#ff8a72';
     uctx.font = '700 34px ui-monospace, Menlo, monospace';
-    uctx.fillText('SIGNAL LOST', W / 2, H / 2 - 60);
+    uctx.fillText('SIGNAL LOST', W / 2, H / 2 - 70);
     uctx.fillStyle = '#f0f4f8';
     uctx.font = FONT;
-    uctx.fillText('deliveries ' + run.deliveries + '   ·   score ' + run.score + '   ·   ' + Math.round(run.time) + 's', W / 2, H / 2 - 14);
+    uctx.fillText('deliveries ' + run.deliveries + '   ·   score ' + run.score + '   ·   ' + Math.round(run.time) + 's', W / 2, H / 2 - 24);
+    uctx.fillStyle = 'rgba(160,180,195,0.7)';
+    uctx.fillText('best this session ' + run.best, W / 2, H / 2 + 2);
     uctx.fillStyle = 'rgba(255,176,74,' + (0.55 + Math.sin(t * 3) * 0.35) + ')';
-    uctx.fillText('PRESS ENTER TO WALK AGAIN', W / 2, H / 2 + 44);
+    uctx.fillText('PRESS ENTER TO WALK AGAIN', W / 2, H / 2 + 52);
   }
 
   uctx.restore();
@@ -826,6 +1254,7 @@ resize();
 
 // ---------- main loop ----------
 updateChunks(0, 0);
+ensureStorms(4);
 placeDelivery();
 let prev = performance.now();
 let elapsed = 0;
@@ -850,6 +1279,7 @@ function frame(now) {
     updateWorld(dt, elapsed);
   } else if (gameState === 'perk') {
     poseWalker(elapsed, false);
+    updateDust(dt);
   }
 
   updateCamera(dt);
@@ -862,11 +1292,13 @@ requestAnimationFrame(frame);
 // debug/telemetry handle for automated testing and motion-capture export
 if (location.search.includes('debug')) {
   window.__walker = {
-    player, run, stats, delivery, storms, telemetry,
+    player, run, stats, delivery, storms, hounds, telemetry,
     get state() { return gameState; },
+    get contract() { return contract; },
     get perkOffers() { return perkOffers.map((o) => o.name); },
     get chunks() { return chunks.size; },
     get salvage() { return salvageList.length; },
+    damage(n) { damage(n, 'debug'); },
     teleport(x, z) { player.x = x; player.z = z; player.y = WALK(x, z); },
     goToDelivery() { player.x = delivery.x; player.z = delivery.z; player.y = WALK(delivery.x, delivery.z); },
   };

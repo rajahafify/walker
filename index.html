@@ -176,6 +176,17 @@ function WALK(x, z) {
   return base + roll + fine;
 }
 
+// water: anything below this level is a river/lake — wading costs you
+const WATER_LEVEL = -1.35;
+const water = new THREE.Mesh(
+  new THREE.PlaneGeometry(600, 600),
+  new THREE.MeshStandardMaterial({ color: 0x123040, transparent: true, opacity: 0.85, roughness: 0.12, metalness: 0.65 })
+);
+water.rotation.x = -Math.PI / 2;
+water.position.y = WATER_LEVEL;
+water.receiveShadow = true;
+scene.add(water);
+
 const chunks = new Map();
 const rockGeo = new THREE.IcosahedronGeometry(1, 0);
 const rockMat = new THREE.MeshStandardMaterial({ color: 0x4a4a42, roughness: 1, flatShading: true });
@@ -392,6 +403,8 @@ const sfx = {
   perk() { [440, 554, 659].forEach((f, i) => setTimeout(() => audio.tone(f, 0.16, 'triangle', 0.06), i * 70)); },
   fail() { audio.tone(220, 0.42, 'sawtooth', 0.07, 108); },
   hunter() { audio.tone(140, 0.3, 'square', 0.03, 90); },
+  trip() { audio.noise(0.22, 0.11, 180); audio.tone(120, 0.2, 'triangle', 0.06, 60); },
+  wade() { audio.noise(0.09, 0.03, 900); },
 };
 
 // ---------- walker ----------
@@ -475,6 +488,7 @@ const J = walker.userData.J;
 const player = {
   x: 0, z: 0, y: 0, vy: 0, grounded: true, yaw: 0, speed: 0, phase: 0,
   hp: 100, stamina: 100, cargo: 0, sprinting: false, hurtCd: 0, prevSin: 0,
+  balance: 1, boots: 100, crouch: false, cargoCond: 1, tripped: 0, wading: false,
 };
 
 const stats = {};
@@ -483,6 +497,7 @@ function resetStats() {
     speedMul: 1, maxCargo: 3, cargoDrag: 1, maxStamina: 100, stamRegen: 1,
     stamDrain: 1, slopeResist: 0, scoreMul: 1, stormResist: 1, scanRange: 14,
     sprintCost: 1, hunterAggro: 1, hunterDamage: 1, dropCargo: true,
+    balanceGrip: 1, bootWear: 1, cargoArmor: 1, quiet: 1,
   });
 }
 resetStats();
@@ -676,6 +691,10 @@ const PERK_POOL = [
   { name: 'JAMMER', desc: 'Hounds sense you 30% later', apply() { stats.hunterAggro *= 0.7; } },
   { name: 'SHOCK ABSORB', desc: 'Hound hits hurt less, no cargo drop', apply() { stats.hunterDamage *= 0.6; stats.dropCargo = false; } },
   { name: 'SCANNER', desc: 'Spot crates from farther', apply() { stats.scanRange += 22; } },
+  { name: 'BALLAST', desc: 'Much steadier footing under load', apply() { stats.balanceGrip *= 2; } },
+  { name: 'SPARE BOOTS', desc: 'Fresh boots, and they wear slower', apply() { player.boots = 100; stats.bootWear *= 0.6; } },
+  { name: 'HARD CASE', desc: 'Cargo takes half the wear', apply() { stats.cargoArmor *= 0.5; } },
+  { name: 'SILENT TREAD', desc: 'Mist presences notice you later', apply() { stats.quiet *= 0.6; } },
 ];
 
 function offerPerks() {
@@ -706,6 +725,8 @@ function damage(amount, src) {
 function startRun() {
   player.x = 0; player.z = 0; player.yaw = 0; player.speed = 0; player.phase = 0;
   player.hp = 100; player.cargo = 0; player.vy = 0; player.grounded = true;
+  player.balance = 1; player.boots = 100; player.cargoCond = 1; player.tripped = 0;
+  player.crouch = false; player.wading = false;
   resetStats(); player.stamina = stats.maxStamina;
   run.score = 0; run.deliveries = 0; run.time = 0; run.streak = 0;
   lastChunkI = 1e9; lastChunkJ = 1e9;
@@ -734,10 +755,11 @@ function updatePlayer(dt) {
   if (moving) dir.normalize();
 
   const wantSprint = keys.has('ShiftLeft') || keys.has('ShiftRight');
-  const canSprint = wantSprint && moving && player.stamina > 1 && player.grounded;
+  player.crouch = keys.has('KeyC') || keys.has('ControlLeft');
+  const canSprint = wantSprint && moving && player.stamina > 1 && player.grounded && !player.crouch;
   player.sprinting = canSprint;
 
-  const baseSpeed = 3.1 * stats.speedMul * (canSprint ? 1.5 : 1);
+  const baseSpeed = 3.1 * stats.speedMul * (canSprint ? 1.5 : 1) * (player.crouch ? 0.55 : 1);
   const cargoPenalty = 1 / (1 + player.cargo * 0.16 * stats.cargoDrag);
   const contractPenalty = contract && contract.id === 'heavy' ? 0.88 : 1;
   const h = WALK(player.x, player.z);
@@ -746,8 +768,12 @@ function updatePlayer(dt) {
   const uphill = clamp(slope, -1, 1);
   const slopeFactor = clamp(1 - uphill * (0.9 - stats.slopeResist), 0.42, 1.25);
 
+  // deep water slows you and costs stamina; wade, don't sprint
+  player.wading = h < WATER_LEVEL - 0.15;
+  const waterFactor = player.wading ? 0.55 : 1;
+
   const exhausted = player.stamina <= 0.5;
-  const target = moving && !exhausted ? baseSpeed * cargoPenalty * contractPenalty * slopeFactor : 0;
+  const target = moving && !exhausted ? baseSpeed * cargoPenalty * contractPenalty * slopeFactor * waterFactor * (0.55 + 0.45 * player.balance) : 0;
   player.speed = lerp(player.speed, target, 1 - Math.exp(-dt * 7));
 
   if (player.speed > 0.05) {
@@ -778,10 +804,41 @@ function updatePlayer(dt) {
   }
 
   // stamina
-  const effort = moving ? (0.5 + Math.max(0, uphill) * 1.4) * (canSprint ? 2.6 : 1) * stats.sprintCost : 0;
+  const effort = moving ? (0.5 + Math.max(0, uphill) * 1.4 + (player.wading ? 1.2 : 0)) * (canSprint ? 2.6 : 1) * stats.sprintCost : 0;
   if (moving && !exhausted) player.stamina -= effort * 6.2 * dt * stats.stamDrain;
   else player.stamina += 9 * dt * stats.stamRegen;
   player.stamina = clamp(player.stamina, 0, stats.maxStamina);
+
+  // balance: cargo loads you, rough ground and sprinting destabilise you.
+  // Lean against it by slowing down; at zero you trip.
+  const load = player.cargo * 0.22;
+  const roughness = Math.abs(slope) * 0.9 + (player.wading ? 0.3 : 0);
+  const stress = (load + roughness + (canSprint ? 0.35 : 0) + (moving ? 0.12 : -0.4)) * dt * 0.55;
+  player.balance = clamp(player.balance - stress + (1 - player.balance) * dt * 0.5 * stats.balanceGrip, 0.35, 1);
+
+  if (player.balance <= 0.36 && !player.tripped) {
+    // trip: brief stagger, drop a crate, lose cargo condition
+    player.tripped = 1.4;
+    player.speed *= 0.2;
+    sfx.trip();
+    if (player.cargo > 0 && stats.dropCargo) {
+      player.cargo--;
+      player.cargoCond = Math.max(0.2, player.cargoCond - 0.25);
+      say('YOU TRIPPED', 'Lost a crate. Watch your footing with that load.', 2.2);
+    } else {
+      say('YOU TRIPPED', 'Too much weight, too little care.', 2);
+    }
+    damage(6, 'fall');
+  }
+  if (player.tripped > 0) {
+    player.tripped -= dt;
+    if (player.tripped <= 0) player.balance = 0.8;
+  }
+
+  // boots wear with distance; worn boots are slippery and slow
+  if (moving && player.grounded) {
+    player.boots = clamp(player.boots - player.speed * dt * 0.22 * stats.bootWear, 0, 100);
+  }
 
   // storm exposure
   let inStorm = false;
@@ -791,6 +848,7 @@ function updatePlayer(dt) {
   if (inStorm) {
     player.stamina = Math.max(0, player.stamina - 14 * dt);
     player.hp -= 2.4 * dt * stats.stormResist;
+    player.cargoCond = Math.max(0, player.cargoCond - dt * 0.035 * stats.cargoArmor);
     if (player.hp <= 0) { player.hp = 0; run.best = Math.max(run.best, run.score); gameState = 'dead'; }
   }
   if (player.hurtCd > 0) player.hurtCd -= dt;
@@ -858,7 +916,7 @@ function poseWalker(t, inStorm) {
 
 function updateHounds(dt, t) {
   const cargoSense = 1 + player.cargo * 0.12;
-  const aggro = 24 * stats.hunterAggro * cargoSense;
+  const aggro = 24 * stats.hunterAggro * cargoSense * (player.crouch ? 0.5 : 1);
   for (const h of hounds) {
     const u = h.userData;
     const d = dist2(h.position.x, h.position.z, player.x, player.z);
@@ -924,6 +982,8 @@ function updateCamera(dt) {
 
 function updateWorld(dt, t) {
   updateChunks(player.x, player.z);
+  water.position.x = player.x;
+  water.position.z = player.z;
 
   // beacon pulse
   ring.scale.setScalar(1 + Math.sin(t * 2.2) * 0.06);
@@ -982,14 +1042,24 @@ function completeDelivery() {
   let timeBonus = 0;
   if (contract.id === 'express' && contract.total > 0) timeBonus = clamp(contract.timeLeft / contract.total, 0, 1);
   const base = 100 + player.cargo * 25 + Math.min(200, contract.dist * 0.15);
-  let gain = Math.round(base * mult * (1 + timeBonus) * stats.scoreMul);
+  const quality = player.cargoCond;
+  let gain = Math.round(base * mult * (1 + timeBonus) * quality * stats.scoreMul);
   let note = contract.name;
   if (contract.id === 'fragile' && contract.damaged) { gain = Math.round(gain * 0.5); note = 'CARGO COMPROMISED'; }
   run.score += gain;
   run.deliveries++;
   run.streak++;
+
+  // rating: S/A/B/C from cargo condition + time + damage taken this contract
+  let grade = 'C';
+  const q = quality * (1 + timeBonus * 0.3) * (contract.damaged ? 0.6 : 1);
+  if (q > 0.92) grade = 'S';
+  else if (q > 0.75) grade = 'A';
+  else if (q > 0.5) grade = 'B';
+  const likeGain = { S: 480, A: 260, B: 120, C: 40 }[grade];
+
   sfx.deliver();
-  say('DELIVERY COMPLETE  +' + gain, note + '  ·  upgrade available', 3);
+  say('DELIVERY COMPLETE  +' + gain, note + '  ·  rating ' + grade, 3);
   ringMat.color.setHex(0x7fe0c0);
   setTimeout(() => ringMat.color.setHex(0xffb04a), 400);
 
@@ -1058,9 +1128,13 @@ function drawHUD(t) {
   // --- top left: vitals ---
   bar(uctx, 20, 20, 190, 16, player.hp / 100, '#ff5a4d', '#ff9a5a', 'HULL');
   bar(uctx, 20, 42, 190, 16, player.stamina / stats.maxStamina, '#3aa0ff', '#7fe0ff', 'STAMINA');
+  bar(uctx, 20, 64, 92, 10, player.balance, player.balance < 0.5 ? '#ff4d3d' : '#e8d44d', '#fff0a0', '');
+  bar(uctx, 118, 64, 92, 10, player.boots / 100, '#8a8f7a', '#d8dcc8', '');
   uctx.font = FONT; uctx.textAlign = 'left'; uctx.textBaseline = 'middle';
   uctx.fillStyle = 'rgba(200,215,225,0.8)';
-  uctx.fillText('CARGO ' + player.cargo + '/' + stats.maxCargo, 20, 72);
+  uctx.fillText('CARGO ' + player.cargo + '/' + stats.maxCargo, 20, 88);
+  uctx.fillStyle = player.cargoCond > 0.6 ? 'rgba(160,220,180,0.85)' : 'rgba(255,140,110,0.9)';
+  uctx.fillText('COND ' + Math.round(player.cargoCond * 100) + '%', 100, 88);
 
   // --- contract card ---
   if (contract) {
@@ -1189,7 +1263,7 @@ function drawHUD(t) {
     uctx.textAlign = 'left';
     uctx.fillStyle = 'rgba(170,190,205,0.9)';
     uctx.font = FONT;
-    uctx.fillText('WASD move · SHIFT sprint · SPACE jump · drag look · wheel zoom · T telemetry', 20, H - 24);
+    uctx.fillText('WASD move · SHIFT sprint · SPACE jump · C crouch · drag look · wheel zoom · T telemetry', 20, H - 24);
     uctx.globalAlpha = 1;
   }
 

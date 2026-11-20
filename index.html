@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WALKER — a delivery roguelike</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
+  canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
+  #ui { pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="ui"></canvas>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   WALKER
+   Death Stranding-ish traversal + roguelike run progression.
+   All UI is drawn into a 2D canvas layered over the WebGL one.
+   ============================================================ */
+
+// ---------- tiny utils ----------
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a = 1, b = 0) => b + Math.random() * (a - b);
+const dist2 = (ax, az, bx, bz) => Math.hypot(ax - bx, az - bz);
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(x, y) {
+  let h = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+function fbm(x, y) {
+  let s = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < 4; i++) { s += amp * vnoise(x * f, y * f); norm += amp; f *= 2; amp *= 0.5; }
+  return s / norm;
+}
+function angleLerp(a, b, t) {
+  let d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
+  return a + d * t;
+}
+
+// ---------- tuning ----------
+// Gait is modelled on an average adult humanoid platform (~1.75 m, 68 kg):
+// stride ~0.72 m, cadence ~1.9 steps/s at cruise, knee peak flexion ~60 deg
+// in swing, counter-rotating arm swing ~25 deg. Keep these plausible if you
+// retarget real hardware — the telemetry hook records them per frame.
+const GAIT = {
+  stride: 0.72,          // metres per full cycle
+  cadence: 1.9,         // cycles per second at cruise speed
+  hipSwing: 0.52,       // rad
+  kneePeak: 1.02,       // rad (swing phase)
+  ankleSwing: 0.28,
+  armSwing: 0.42,
+  bob: 0.035,
+  lean: 0.09,
+};
+
+const CFG = {
+  chunkSize: 45,
+  chunkSeg: 11,        // vertices per side
+  viewChunks: 2,       // radius -> 5x5 chunks = 225 units
+  eyeHeight: 1.62,
+};
+
+// ---------- renderer / scene ----------
+const glCanvas = document.getElementById('gl');
+const uiCanvas = document.getElementById('ui');
+const uctx = uiCanvas.getContext('2d');
+
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true });
+renderer.setClearColor(0x0b1016);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1016);
+scene.fog = new THREE.FogExp2(0x0b1016, 0.026);
+
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 400);
+
+const hemi = new THREE.HemisphereLight(0x8fb2d8, 0x2a2a22, 1.05);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffe2b8, 1.7);
+sun.position.set(40, 60, 20);
+scene.add(sun);
+const rim = new THREE.DirectionalLight(0x5f7fff, 0.5);
+rim.position.set(-30, 20, -40);
+scene.add(rim);
+
+// ---------- terrain (infinite, chunked) ----------
+// analytic height field: the visual mesh is a sampled version of this,
+// so the walker's feet and the ground always agree.
+function WALK(x, z) {
+  const base = 4.6 * (fbm(x * 0.011 + 11.3, z * 0.011 - 4.7) - 0.5);
+  const roll = 1.15 * Math.sin(x * 0.013) * Math.cos(z * 0.017);
+  const fine = 0.45 * (vnoise(x * 0.06, z * 0.06) - 0.5);
+  return base + roll + fine;
+}
+function groundNormal(x, z, e = 0.6) {
+  const hL = WALK(x - e, z), hR = WALK(x + e, z);
+  const hD = WALK(x, z - e), hU = WALK(x, z + e);
+  return new THREE.Vector3(hL - hR, 2 * e, hD - hU).normalize();
+}
+
+const chunks = new Map(); // key -> { mesh, props, key }
+const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x3b4038, roughness: 1, flatShading: true });
+const tuftGeo = new THREE.ConeGeometry(0.14, 0.75, 4);
+const tuftMat = new THREE.MeshStandardMaterial({ color: 0x27452f, roughness: 1, flatShading: true });
+const salvageList = [];
+
+function chunkKey(ci, cj) { return ci + ',' + cj; }
+
+function buildChunk(ci, cj) {
+  const size = CFG.chunkSize, seg = CFG.chunkSeg;
+  const geo = new THREE.PlaneGeometry(size, size, seg - 1, seg - 1);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const ox = ci * size + size / 2, oz = cj * size + size / 2;
+
+  // bake world coordinates so chunk culling stays correct
+  for (let k = 0; k < pos.count; k++) {
+    const x = pos.getX(k) + ox, z = pos.getZ(k) + oz;
+    pos.setX(k, x); pos.setZ(k, z);
+    pos.setY(k, WALK(x, z));
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  const colors = new Float32Array(pos.count * 3);
+  const cLow = [0.10, 0.17, 0.15], cMid = [0.26, 0.30, 0.22], cHigh = [0.52, 0.50, 0.38];
+  for (let k = 0; k < pos.count; k++) {
+    const t = clamp((pos.getY(k) + 3.4) / 6.8, 0, 1);
+    const c = t < 0.5
+      ? [lerp(cLow[0], cMid[0], t * 2), lerp(cLow[1], cMid[1], t * 2), lerp(cLow[2], cMid[2], t * 2)]
+      : [lerp(cMid[0], cHigh[0], (t - 0.5) * 2), lerp(cMid[1], cHigh[1], (t - 0.5) * 2), lerp(cMid[2], cHigh[2], (t - 0.5) * 2)];
+    colors[k * 3] = c[0]; colors[k * 3 + 1] = c[1]; colors[k * 3 + 2] = c[2];
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.96, metalness: 0.0 });
+  const mesh = new THREE.Mesh(geo, mat);
+  scene.add(mesh);
+
+  // deterministic scattered props
+  const key = chunkKey(ci, cj);
+  const rnd = mulberry32((Math.imul(ci, 73856093) ^ Math.imul(cj, 19349663) ^ 0x9e3779b9) | 0);
+  const props = new THREE.Group();
+  const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 5);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(), p = new THREE.Vector3();
+  for (let i = 0; i < 5; i++) {
+    const x = ox + (rnd() - 0.5) * size, z = oz + (rnd() - 0.5) * size;
+    const s = 0.25 + rnd() * 0.9;
+    p.set(x, WALK(x, z) - s * 0.25, z);
+    q.setFromEuler(new THREE.Euler(rnd() * 3, rnd() * 6, rnd() * 3));
+    sc.set(s, s * (0.5 + rnd() * 0.6), s);
+    rocks.setMatrixAt(i, m4.compose(p, q, sc));
+  }
+  rocks.instanceMatrix.needsUpdate = true;
+  props.add(rocks);
+
+  const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, 24);
+  for (let i = 0; i < 24; i++) {
+    const x = ox + (rnd() - 0.5) * size, z = oz + (rnd() - 0.5) * size;
+    const s = 0.6 + rnd() * 0.9;
+    p.set(x, WALK(x, z) + 0.25 * s, z);
+    q.setFromEuler(new THREE.Euler((rnd() - 0.5) * 0.3, rnd() * 6, (rnd() - 0.5) * 0.3));
+    sc.set(s, s, s);
+    tufts.setMatrixAt(i, m4.compose(p, q, sc));
+  }
+  tufts.instanceMatrix.needsUpdate = true;
+  props.add(tufts);
+  scene.add(props);
+
+  // occasional supply crate
+  if (rnd() > 0.55) {
+    const x = ox + (rnd() - 0.5) * size, z = oz + (rnd() - 0.5) * size;
+    const crate = makeSalvage(x, WALK(x, z), z);
+    crate.key = key;
+    salvageList.push(crate);
+  }
+
+  chunks.set(key, { mesh, props, key });
+}
+
+function removeChunk(key) {
+  const c = chunks.get(key);
+  if (!c) return;
+  scene.remove(c.mesh); c.mesh.geometry.dispose(); c.mesh.material.dispose();
+  scene.remove(c.props);
+  for (let i = salvageList.length - 1; i >= 0; i--) {
+    if (salvageList[i].key === key) {
+      scene.remove(salvageList[i].mesh);
+      salvageList.splice(i, 1);
+    }
+  }
+  chunks.delete(key);
+}
+
+let lastChunkI = 1e9, lastChunkJ = 1e9;
+function updateChunks(px, pz) {
+  const size = CFG.chunkSize;
+  const ci = Math.floor(px / size), cj = Math.floor(pz / size);
+  if (ci === lastChunkI && cj === lastChunkJ) return;
+  lastChunkI = ci; lastChunkJ = cj;
+  const R = CFG.viewChunks;
+  const wanted = new Set();
+  for (let i = ci - R; i <= ci + R; i++)
+    for (let j = cj - R; j <= cj + R; j++) {
+      const k = chunkKey(i, j);
+      wanted.add(k);
+      if (!chunks.has(k)) buildChunk(i, j);
+    }
+  for (const k of [...chunks.keys()]) if (!wanted.has(k)) removeChunk(k);
+}
+
+// ---------- walker ----------
+function makeWalker() {
+  const shell = new THREE.MeshStandardMaterial({ color: 0xd2d6d2, roughness: 0.5, metalness: 0.2 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x2a2f36, roughness: 0.8, metalness: 0.25 });
+  const glow = new THREE.MeshStandardMaterial({ color: 0xffa04d, emissive: 0xff6a00, emissiveIntensity: 1.4, roughness: 0.4 });
+  const J = {};
+  const root = new THREE.Group();
+
+  const hips = new THREE.Group(); hips.position.y = 1.02; root.add(hips); J.hips = hips;
+  const pelvis = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.18, 0.24), dark);
+  hips.add(pelvis);
+
+  const torso = new THREE.Group(); torso.position.y = 0.09; hips.add(torso); J.torso = torso;
+  const chest = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.44, 0.26), shell);
+  chest.position.y = 0.24; torso.add(chest);
+  const pack = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.30, 0.16), dark);
+  pack.position.set(0, 0.26, -0.2); torso.add(pack);
+
+  const cargoBoxes = [];
+  for (let i = 0; i < 4; i++) {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(0.28 - i * 0.02, 0.09, 0.13), glow);
+    b.position.set(0, 0.44 + i * 0.1, -0.21);
+    b.visible = false;
+    torso.add(b);
+    cargoBoxes.push(b);
+  }
+
+  const neck = new THREE.Group(); neck.position.y = 0.5; torso.add(neck); J.neck = neck;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.22), shell);
+  head.position.y = 0.12; neck.add(head);
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.045, 0.02), glow);
+  visor.position.set(0, 0.13, 0.115); neck.add(visor);
+
+  // legs: hip -> thigh -> knee -> shin -> ankle -> foot
+  for (const s of [-1, 1]) {
+    const hip = new THREE.Group(); hip.position.set(0.11 * s, -0.05, 0); hips.add(hip);
+    const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.46, 0.15), shell);
+    thigh.position.y = -0.23; hip.add(thigh);
+    const knee = new THREE.Group(); knee.position.y = -0.46; hip.add(knee);
+    const shin = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.44, 0.12), dark);
+    shin.position.y = -0.22; knee.add(shin);
+    const ankle = new THREE.Group(); ankle.position.y = -0.44; knee.add(ankle);
+    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.07, 0.26), shell);
+    foot.position.set(0, -0.035, 0.06); ankle.add(foot);
+    const nm = s < 0 ? 'L' : 'R';
+    J['hip' + nm] = hip; J['knee' + nm] = knee; J['ankle' + nm] = ankle;
+  }
+  // arms: shoulder -> upper -> elbow -> forearm
+  for (const s of [-1, 1]) {
+    const sh = new THREE.Group(); sh.position.set(0.255 * s, 0.4, 0); torso.add(sh);
+    const up = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.34, 0.1), shell);
+    up.position.y = -0.17; sh.add(up);
+    const el = new THREE.Group(); el.position.y = -0.34; sh.add(el);
+    const lo = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.3, 0.09), dark);
+    lo.position.y = -0.15; el.add(lo);
+    const nm = s < 0 ? 'L' : 'R';
+    J['sh' + nm] = sh; J['el' + nm] = el;
+  }
+
+  root.userData = { J, cargoBoxes };
+  return root;
+}
+
+const walker = makeWalker();
+scene.add(walker);
+const J = walker.userData.J;
+
+// ---------- player ----------
+const player = {
+  x: 0, z: 0, y: 0, yaw: 0, speed: 0, phase: 0,
+  hp: 100, stamina: 100, cargo: 0,
+};
+
+const stats = {};
+function resetStats() {
+  Object.assign(stats, {
+    speedMul: 1, maxCargo: 3, cargoDrag: 1, maxStamina: 100, stamRegen: 1,
+    stamDrain: 1, slopeResist: 0, scoreMul: 1, stormResist: 1, scanRange: 14,
+  });
+}
+resetStats();
+
+const run = { score: 0, deliveries: 0, time: 0 };
+let gameState = 'title'; // title | play | perk | dead
+let perkOffers = [];
+let message = { text: '', sub: '', t: 0 };
+
+function say(text, sub = '', dur = 2.6) { message = { text, sub, t: dur }; }
+
+// ---------- camera orbit ----------
+const cam = { yaw: Math.PI, pitch: 0.22, dist: 7.2, pos: new THREE.Vector3(0, 6, 10) };
+
+// ---------- delivery beacon ----------
+const beaconGroup = new THREE.Group();
+scene.add(beaconGroup);
+const beam = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.55, 0.9, 46, 10, 1, true),
+  new THREE.MeshBasicMaterial({ color: 0xffb04a, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false })
+);
+beam.position.y = 23;
+beaconGroup.add(beam);
+const ringMat = new THREE.MeshBasicMaterial({ color: 0xffb04a, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+const ring = new THREE.Mesh(new THREE.TorusGeometry(2.2, 0.07, 6, 40), ringMat);
+ring.rotation.x = -Math.PI / 2;
+beaconGroup.add(ring);
+const ring2 = new THREE.Mesh(new THREE.TorusGeometry(1.2, 0.05, 6, 32), ringMat);
+ring2.rotation.x = -Math.PI / 2;
+beaconGroup.add(ring2);
+
+const delivery = { x: 200, z: 0 };
+
+function placeDelivery() {
+  const d = 165 + Math.min(260, run.deliveries * 22);
+  const a = rand(TAU);
+  delivery.x = player.x + Math.sin(a) * d;
+  delivery.z = player.z + Math.cos(a) * d;
+  beaconGroup.position.set(delivery.x, WALK(delivery.x, delivery.z), delivery.z);
+}
+
+// ---------- salvage ----------
+const salvageGeo = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+const salvageMat = new THREE.MeshStandardMaterial({ color: 0x7fe0c0, emissive: 0x0d5c46, emissiveIntensity: 1.2, roughness: 0.4 });
+function makeSalvage(x, y, z) {
+  const m = new THREE.Mesh(salvageGeo, salvageMat);
+  m.position.set(x, y + 0.6, z);
+  scene.add(m);
+  return { mesh: m, x, z, taken: false, key: null };
+}
+
+// ---------- storms ----------
+const storms = [];
+const stormGeo = new THREE.BufferGeometry();
+{
+  const N = 900, pts = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const a = rand(TAU), r = Math.sqrt(rand(1)) * 34, y = rand(14);
+    pts[i * 3] = Math.cos(a) * r; pts[i * 3 + 1] = y; pts[i * 3 + 2] = Math.sin(a) * r;
+  }
+  stormGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+}
+const stormMat = new THREE.PointsMaterial({ color: 0x9aa6b8, size: 0.22, transparent: true, opacity: 0.55, depthWrite: false });
+
+function relocateStorm(s) {
+  const a = rand(TAU), d = 180 + rand(220);
+  s.x = player.x + Math.sin(a) * d;
+  s.z = player.z + Math.cos(a) * d;
+  s.radius = 34 + rand(18);
+  s.points.position.set(s.x, WALK(s.x, s.z), s.z);
+}
+for (let i = 0; i < 4; i++) {
+  const s = { x: 0, z: 0, radius: 40, points: new THREE.Points(stormGeo, stormMat) };
+  relocateStorm(s);
+  scene.add(s.points);
+  storms.push(s);
+}
+
+// ---------- input ----------
+const keys = new Set();
+addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (e.code === 'Enter' || e.code === 'Space') {
+    if (gameState === 'title') startRun();
+    else if (gameState === 'dead') startRun();
+  }
+  if (gameState === 'perk' && /^Digit[123]$/.test(e.code)) {
+    const i = +e.code.slice(5) - 1;
+    if (perkOffers[i]) { perkOffers[i].apply(); say(perkOffers[i].name, perkOffers[i].desc, 2.2); perkOffers = []; gameState = 'play'; placeDelivery(); }
+  }
+  if (e.code === 'KeyT' && gameState === 'play') { telemetry.on = !telemetry.on; say(telemetry.on ? 'TELEMETRY ON' : 'TELEMETRY OFF'); }
+  if (['ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+
+let dragging = false, lastX = 0, lastY = 0;
+glCanvas.addEventListener('pointerdown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+addEventListener('pointerup', () => (dragging = false));
+addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = clamp(cam.pitch + (e.clientY - lastY) * 0.004, -0.15, 0.95);
+  lastX = e.clientX; lastY = e.clientY;
+});
+addEventListener('wheel', (e) => { cam.dist = clamp(cam.dist + e.deltaY * 0.006, 3.5, 14); }, { passive: true });
+
+// ---------- telemetry (for the humanoid-motion side objective) ----------
+const telemetry = { on: false, frames: [] };
+window.WALKER_TELEMETRY = telemetry;
+function recordFrame(slope) {
+  if (!telemetry.on || telemetry.frames.length > 20000) return;
+  telemetry.frames.push({
+    t: +run.time.toFixed(3), speed: +player.speed.toFixed(3), slope: +slope.toFixed(3),
+    hipL: +J.hipL.rotation.x.toFixed(4), hipR: +J.hipR.rotation.x.toFixed(4),
+    kneeL: +J.kneeL.rotation.x.toFixed(4), kneeR: +J.kneeR.rotation.x.toFixed(4),
+    ankleL: +J.ankleL.rotation.x.toFixed(4), ankleR: +J.ankleR.rotation.x.toFixed(4),
+    shoulderL: +J.shL.rotation.x.toFixed(4), shoulderR: +J.shR.rotation.x.toFixed(4),
+    elbowL: +J.elL.rotation.x.toFixed(4), elbowR: +J.elR.rotation.x.toFixed(4),
+  });
+}
+
+// ---------- perks ----------
+const PERK_POOL = [
+  { name: 'LONG STRIDE', desc: '+12% walk speed', apply() { stats.speedMul *= 1.12; } },
+  { name: 'CARGO FRAME', desc: '+1 cargo slot, lighter load', apply() { stats.maxCargo++; stats.cargoDrag *= 0.8; } },
+  { name: 'IRON LUNGS', desc: '+30 stamina, faster recovery', apply() { stats.maxStamina += 30; stats.stamRegen *= 1.3; player.stamina = stats.maxStamina; } },
+  { name: 'GYRO STABILIZER', desc: 'Ignore most slope drag', apply() { stats.slopeResist += 0.4; } },
+  { name: 'FIELD REPAIR', desc: 'Restore 35 hull', apply() { player.hp = Math.min(100, player.hp + 35); } },
+  { name: 'LIGHT STEPS', desc: '-25% stamina drain', apply() { stats.stamDrain *= 0.75; } },
+  { name: 'SALVAGE EYE', desc: '+40% delivery score', apply() { stats.scoreMul *= 1.4; } },
+  { name: 'AUX BATTERY', desc: 'Half storm damage', apply() { stats.stormResist *= 0.5; } },
+  { name: 'SCANNER', desc: 'Spot crates from farther', apply() { stats.scanRange += 22; } },
+];
+
+function offerPerks() {
+  const pool = PERK_POOL.slice();
+  perkOffers = [];
+  for (let i = 0; i < 3 && pool.length; i++) {
+    perkOffers.push(pool.splice(Math.floor(rand(pool.length)), 1)[0]);
+  }
+  gameState = 'perk';
+}
+
+// ---------- run lifecycle ----------
+function startRun() {
+  player.x = 0; player.z = 0; player.yaw = 0; player.speed = 0; player.phase = 0;
+  player.hp = 100; player.cargo = 0;
+  resetStats(); player.stamina = stats.maxStamina;
+  run.score = 0; run.deliveries = 0; run.time = 0;
+  lastChunkI = 1e9; lastChunkJ = 1e9;
+  updateChunks(0, 0);
+  telemetry.frames = [];
+  placeDelivery();
+  for (const s of storms) relocateStorm(s);
+  gameState = 'play';
+  say('CONTRACT ACCEPTED', 'Deliver to the beacon. Do not die out there.', 3.2);
+}
+
+// ---------- update ----------
+function updatePlayer(dt) {
+  const f = new THREE.Vector3(-Math.sin(cam.yaw), 0, -Math.cos(cam.yaw));
+  const r = new THREE.Vector3(-f.z, 0, f.x);
+  let ix = 0, iz = 0;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) iz += 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown')) iz -= 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) ix -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) ix += 1;
+  const moving = ix !== 0 || iz !== 0;
+
+  const dir = new THREE.Vector3().addScaledVector(f, iz).addScaledVector(r, ix);
+  if (moving) dir.normalize();
+
+  const baseSpeed = 3.1 * stats.speedMul;
+  const cargoPenalty = 1 / (1 + player.cargo * 0.16 * stats.cargoDrag);
+  const h = WALK(player.x, player.z);
+  const hAhead = WALK(player.x + dir.x * 1.2, player.z + dir.z * 1.2);
+  const slope = moving ? (hAhead - h) / 1.2 : 0;
+  const uphill = clamp(slope, -1, 1);
+  const slopeFactor = clamp(1 - uphill * (0.9 - stats.slopeResist), 0.42, 1.25);
+
+  const exhausted = player.stamina <= 0.5;
+  const target = moving && !exhausted ? baseSpeed * cargoPenalty * slopeFactor : 0;
+  player.speed = lerp(player.speed, target, 1 - Math.exp(-dt * 7));
+
+  if (player.speed > 0.05) {
+    player.x += dir.x * player.speed * dt;
+    player.z += dir.z * player.speed * dt;
+    const wantYaw = Math.atan2(dir.x, dir.z);
+    player.yaw = angleLerp(player.yaw, wantYaw, 1 - Math.exp(-dt * 10));
+  }
+  player.y = WALK(player.x, player.z);
+
+  // stamina
+  const effort = moving ? (0.5 + Math.max(0, uphill) * 1.4) : 0;
+  if (moving && !exhausted) player.stamina -= effort * 6.2 * dt * stats.stamDrain;
+  else player.stamina += 9 * dt * stats.stamRegen;
+  player.stamina = clamp(player.stamina, 0, stats.maxStamina);
+
+  // storm exposure
+  let inStorm = false;
+  for (const s of storms) {
+    if (dist2(player.x, player.z, s.x, s.z) < s.radius) { inStorm = true; break; }
+  }
+  if (inStorm) {
+    player.stamina = Math.max(0, player.stamina - 14 * dt);
+    player.hp -= 2.4 * dt * stats.stormResist;
+    if (player.hp <= 0) { player.hp = 0; gameState = 'dead'; }
+  }
+
+  // gait phase
+  const cadence = GAIT.cadence * clamp(player.speed / 3.1, 0.35, 1.6);
+  player.phase += dt * cadence * TAU * (player.speed > 0.05 ? 1 : 0);
+  if (player.speed <= 0.05) player.phase += dt * 0.6; // idle breathing drift
+
+  recordFrame(slope);
+  return inStorm;
+}
+
+function poseWalker(t, inStorm) {
+  const sp = clamp(player.speed / 3.1, 0, 1.4);
+  const p = player.phase;
+  const sw = Math.sin(p), cw = Math.cos(p);
+  const amp = clamp(sp, 0, 1);
+  const breeze = inStorm ? 1 : 0;
+
+  // legs — hip extension/flexion; knee flexion peaks mid-swing (p ≈ π),
+  // plus a small stance-phase flex like a real loading response
+  J.hipL.rotation.x = -GAIT.hipSwing * amp * sw;
+  J.hipR.rotation.x = GAIT.hipSwing * amp * sw;
+  J.kneeL.rotation.x = GAIT.kneePeak * amp * Math.max(0, -cw) + 0.06;
+  J.kneeR.rotation.x = GAIT.kneePeak * amp * Math.max(0, cw) + 0.06;
+  J.ankleL.rotation.x = -GAIT.ankleSwing * amp * Math.max(0, -sw);
+  J.ankleR.rotation.x = -GAIT.ankleSwing * amp * Math.max(0, sw);
+
+  // arms counter-swing
+  J.shL.rotation.x = GAIT.armSwing * amp * sw;
+  J.shR.rotation.x = -GAIT.armSwing * amp * sw;
+  J.elL.rotation.x = -0.18 - 0.3 * amp;
+  J.elR.rotation.x = -0.18 - 0.3 * amp;
+
+  // torso: vertical bob, forward lean with speed + cargo, lateral sway
+  const bob = Math.abs(cw) * GAIT.bob * amp;
+  J.hips.position.y = 1.02 + bob - (player.cargo * 0.012);
+  J.torso.rotation.x = GAIT.lean * amp + player.cargo * 0.02 + Math.sin(t * 1.4) * 0.012;
+  J.torso.rotation.z = 0.035 * amp * sw;
+  J.torso.rotation.y = -0.06 * amp * sw;
+  J.neck.rotation.x = -0.05 * amp + Math.sin(t * 1.1) * 0.02;
+  J.neck.rotation.y = 0.08 * amp * sw;
+
+  // storm buffeting
+  if (breeze) {
+    J.torso.rotation.z += Math.sin(t * 7.3) * 0.05;
+    J.torso.rotation.x += Math.sin(t * 5.1) * 0.04;
+    J.shL.rotation.z = 0.25 + Math.sin(t * 6) * 0.06;
+    J.shR.rotation.z = -0.25 - Math.sin(t * 6.4) * 0.06;
+  } else {
+    J.shL.rotation.z = 0.1;
+    J.shR.rotation.z = -0.1;
+  }
+
+  // cargo stack
+  walker.userData.cargoBoxes.forEach((b, i) => { b.visible = i < player.cargo; });
+}
+
+function updateCamera(dt) {
+  const r = Math.cos(cam.pitch) * cam.dist;
+  const hgt = Math.sin(cam.pitch) * cam.dist + 1.4;
+  const tx = player.x + Math.sin(cam.yaw) * r;
+  const tz = player.z + Math.cos(cam.yaw) * r;
+  const ty = player.y + hgt;
+  cam.pos.x = lerp(cam.pos.x, tx, 1 - Math.exp(-dt * 6));
+  cam.pos.y = lerp(cam.pos.y, ty, 1 - Math.exp(-dt * 4));
+  cam.pos.z = lerp(cam.pos.z, tz, 1 - Math.exp(-dt * 6));
+  camera.position.copy(cam.pos);
+  camera.lookAt(player.x, player.y + 1.25, player.z);
+}
+
+function updateWorld(dt, t) {
+  updateChunks(player.x, player.z);
+
+  // beacon pulse
+  ring.scale.setScalar(1 + Math.sin(t * 2.2) * 0.06);
+  ring2.scale.setScalar(1 + Math.sin(t * 2.2 + 1) * 0.08);
+  beam.material.opacity = 0.12 + Math.sin(t * 1.7) * 0.04;
+
+  // delivery check
+  if (gameState === 'play' && dist2(player.x, player.z, delivery.x, delivery.z) < 3.2) {
+    run.deliveries++;
+    const gain = Math.round((120 + player.cargo * 30) * stats.scoreMul);
+    run.score += gain;
+    say('DELIVERY COMPLETE', '+' + gain + '  ·  upgrade available', 3);
+    ringMat.color.setHex(0x7fe0c0);
+    setTimeout(() => ringMat.color.setHex(0xffb04a), 400);
+    offerPerks();
+  }
+
+  // salvage pickup
+  for (const s of salvageList) {
+    if (s.taken) continue;
+    s.mesh.rotation.y += dt * 1.4;
+    s.mesh.position.y = WALK(s.x, s.z) + 0.6 + Math.sin(t * 2 + s.x) * 0.1;
+    if (dist2(player.x, player.z, s.x, s.z) < 1.7) {
+      s.taken = true;
+      scene.remove(s.mesh);
+      if (player.cargo < stats.maxCargo) { player.cargo++; say('CARGO +1', 'Heavier now. Worth more on delivery.', 1.8); }
+      else { run.score += 30; say('CARGO FULL', '+30 salvage', 1.8); }
+    }
+  }
+
+  // storms drift + relocate
+  for (const s of storms) {
+    s.points.rotation.y += dt * 0.25;
+    if (dist2(player.x, player.z, s.x, s.z) > 520) relocateStorm(s);
+  }
+}
+
+// ---------- HUD (canvas 2D, no HTML) ----------
+const FONT = '600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const FONT_BIG = '700 46px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function bar(ctx, x, y, w, h, frac, colA, colB, label) {
+  ctx.fillStyle = 'rgba(8,12,17,0.62)';
+  roundRect(ctx, x, y, w, h, 3);
+  const g = ctx.createLinearGradient(x, 0, x + w, 0);
+  g.addColorStop(0, colA); g.addColorStop(1, colB);
+  ctx.fillStyle = g;
+  roundRect(ctx, x + 1, y + 1, Math.max(0, (w - 2) * clamp(frac, 0, 1)), h - 2, 2);
+  if (label) {
+    ctx.font = FONT;
+    ctx.fillStyle = 'rgba(220,232,240,0.85)';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + 8, y + h / 2 + 0.5);
+  }
+}
+
+function drawHUD(t) {
+  const W = uiCanvas.width / dpr, H = uiCanvas.height / dpr;
+  uctx.clearRect(0, 0, W, H);
+  uctx.save();
+
+  if (gameState === 'title') {
+    uctx.textAlign = 'center'; uctx.textBaseline = 'middle';
+    uctx.fillStyle = 'rgba(6,9,13,0.55)'; uctx.fillRect(0, 0, W, H);
+    uctx.font = FONT_BIG;
+    uctx.fillStyle = '#f0f4f8';
+    uctx.fillText('W A L K E R', W / 2, H / 2 - 40);
+    uctx.font = FONT;
+    uctx.fillStyle = 'rgba(180,200,215,0.9)';
+    uctx.fillText('a delivery roguelike — carry, climb, survive, upgrade', W / 2, H / 2 + 8);
+    uctx.fillStyle = 'rgba(255,176,74,' + (0.55 + Math.sin(t * 3) * 0.35) + ')';
+    uctx.fillText('PRESS ENTER TO ACCEPT YOUR FIRST CONTRACT', W / 2, H / 2 + 56);
+    uctx.fillStyle = 'rgba(140,160,175,0.75)';
+    uctx.fillText('WASD move   ·   drag to look   ·   wheel zoom', W / 2, H - 60);
+    uctx.restore();
+    return;
+  }
+
+  // --- top left: vitals ---
+  bar(uctx, 20, 20, 190, 16, player.hp / 100, '#ff5a4d', '#ff9a5a', 'HULL');
+  bar(uctx, 20, 42, 190, 16, player.stamina / stats.maxStamina, '#3aa0ff', '#7fe0ff', 'STAMINA');
+  uctx.font = FONT; uctx.textAlign = 'left'; uctx.textBaseline = 'middle';
+  uctx.fillStyle = 'rgba(200,215,225,0.8)';
+  uctx.fillText('CARGO ' + player.cargo + '/' + stats.maxCargo, 20, 72);
+
+  // --- top right: score ---
+  uctx.textAlign = 'right';
+  uctx.fillStyle = '#f0f4f8';
+  uctx.font = FONT_BIG.replace('46px', '22px');
+  uctx.fillText(String(run.score).padStart(5, '0'), W - 20, 32);
+  uctx.font = FONT;
+  uctx.fillStyle = 'rgba(160,180,195,0.8)';
+  uctx.fillText('DELIVERIES ' + run.deliveries, W - 20, 54);
+
+  // --- compass to target ---
+  const rel = Math.atan2(delivery.x - player.x, delivery.z - player.z);
+  const camFwd = Math.atan2(-Math.sin(cam.yaw), -Math.cos(cam.yaw));
+  const bearing = rel - camFwd;
+  const cx = W / 2, cy = 46, R = 26;
+  uctx.save();
+  uctx.translate(cx, cy);
+  uctx.strokeStyle = 'rgba(120,140,155,0.35)';
+  uctx.lineWidth = 1.5;
+  uctx.beginPath(); uctx.arc(0, 0, R, 0, TAU); uctx.stroke();
+  uctx.rotate(-bearing);
+  uctx.fillStyle = '#ffb04a';
+  uctx.beginPath();
+  uctx.moveTo(0, -R - 4); uctx.lineTo(-6, -R + 8); uctx.lineTo(6, -R + 8);
+  uctx.closePath(); uctx.fill();
+  uctx.restore();
+  const d = dist2(player.x, player.z, delivery.x, delivery.z);
+  uctx.textAlign = 'center';
+  uctx.fillStyle = 'rgba(210,222,232,0.85)';
+  uctx.font = FONT;
+  uctx.fillText(Math.round(d) + ' m', cx, cy + R + 16);
+
+  // --- center message ---
+  if (message.t > 0) {
+    const a = clamp(message.t, 0, 1);
+    uctx.globalAlpha = a;
+    uctx.textAlign = 'center';
+    uctx.fillStyle = '#ffe6c4';
+    uctx.font = '700 20px ui-monospace, Menlo, monospace';
+    uctx.fillText(message.text, W / 2, H * 0.34);
+    if (message.sub) {
+      uctx.fillStyle = 'rgba(190,205,218,0.85)';
+      uctx.font = FONT;
+      uctx.fillText(message.sub, W / 2, H * 0.34 + 24);
+    }
+    uctx.globalAlpha = 1;
+  }
+
+  // --- storm warning ---
+  const inStorm = storms.some((s) => dist2(player.x, player.z, s.x, s.z) < s.radius);
+  if (inStorm) {
+    const a = 0.35 + Math.sin(t * 8) * 0.12;
+    const g = uctx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.85);
+    g.addColorStop(0, 'rgba(90,120,160,0)');
+    g.addColorStop(1, 'rgba(90,130,180,' + a + ')');
+    uctx.fillStyle = g; uctx.fillRect(0, 0, W, H);
+    uctx.textAlign = 'center';
+    uctx.fillStyle = 'rgba(200,225,255,' + (0.6 + Math.sin(t * 8) * 0.3) + ')';
+    uctx.font = '700 16px ui-monospace, Menlo, monospace';
+    uctx.fillText('STORM — GET OUT OF IT', W / 2, 100);
+  }
+
+  // --- low stamina / low hull flashes ---
+  if (player.stamina < 12) {
+    uctx.textAlign = 'center';
+    uctx.fillStyle = 'rgba(255,190,120,' + (0.5 + Math.sin(t * 9) * 0.3) + ')';
+    uctx.font = FONT;
+    uctx.fillText('EXHAUSTED — REST TO RECOVER', W / 2, H - 92);
+  }
+
+  // --- controls hint (first 12s of a run) ---
+  if (run.time < 12) {
+    uctx.globalAlpha = clamp(12 - run.time, 0, 1) * 0.7;
+    uctx.textAlign = 'left';
+    uctx.fillStyle = 'rgba(170,190,205,0.9)';
+    uctx.font = FONT;
+    uctx.fillText('WASD move · drag look · wheel zoom · T telemetry', 20, H - 24);
+    uctx.globalAlpha = 1;
+  }
+
+  // --- perk picker ---
+  if (gameState === 'perk') {
+    uctx.fillStyle = 'rgba(6,9,13,0.78)'; uctx.fillRect(0, 0, W, H);
+    uctx.textAlign = 'center';
+    uctx.fillStyle = '#f0f4f8';
+    uctx.font = '700 26px ui-monospace, Menlo, monospace';
+    uctx.fillText('DELIVERY LOGGED — CHOOSE AN UPGRADE', W / 2, H / 2 - 130);
+    perkOffers.forEach((o, i) => {
+      const cw = 300, ch = 84, gap = 18;
+      const x = W / 2 - cw / 2, y = H / 2 - 90 + i * (ch + gap);
+      uctx.fillStyle = 'rgba(18,26,34,0.95)';
+      roundRect(uctx, x, y, cw, ch, 8);
+      uctx.strokeStyle = 'rgba(255,176,74,0.5)'; uctx.lineWidth = 1.5;
+      uctx.strokeRect(x + 0.5, y + 0.5, cw - 1, ch - 1);
+      uctx.textAlign = 'left';
+      uctx.fillStyle = '#ffb04a';
+      uctx.font = '700 15px ui-monospace, Menlo, monospace';
+      uctx.fillText('[' + (i + 1) + ']  ' + o.name, x + 20, y + 32);
+      uctx.fillStyle = 'rgba(200,214,226,0.85)';
+      uctx.font = FONT;
+      uctx.fillText(o.desc, x + 20, y + 56);
+    });
+  }
+
+  // --- death screen ---
+  if (gameState === 'dead') {
+    uctx.fillStyle = 'rgba(10,6,6,0.8)'; uctx.fillRect(0, 0, W, H);
+    uctx.textAlign = 'center';
+    uctx.fillStyle = '#ff8a72';
+    uctx.font = '700 34px ui-monospace, Menlo, monospace';
+    uctx.fillText('SIGNAL LOST', W / 2, H / 2 - 60);
+    uctx.fillStyle = '#f0f4f8';
+    uctx.font = FONT;
+    uctx.fillText('deliveries ' + run.deliveries + '   ·   score ' + run.score + '   ·   ' + Math.round(run.time) + 's', W / 2, H / 2 - 14);
+    uctx.fillStyle = 'rgba(255,176,74,' + (0.55 + Math.sin(t * 3) * 0.35) + ')';
+    uctx.fillText('PRESS ENTER TO WALK AGAIN', W / 2, H / 2 + 44);
+  }
+
+  uctx.restore();
+}
+
+// ---------- resize ----------
+let dpr = 1;
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, h, false);
+  uiCanvas.width = Math.floor(w * dpr);
+  uiCanvas.height = Math.floor(h * dpr);
+  uctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- main loop ----------
+updateChunks(0, 0);
+placeDelivery();
+let prev = performance.now();
+let elapsed = 0;
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - prev) / 1000);
+  prev = now;
+  elapsed += dt;
+
+  if (gameState === 'play') {
+    run.time += dt;
+    const inStorm = updatePlayer(dt);
+    poseWalker(elapsed, inStorm);
+    walker.position.set(player.x, player.y, player.z);
+    walker.rotation.y = player.yaw;
+    updateWorld(dt, elapsed);
+    if (message.t > 0) message.t -= dt;
+  } else if (gameState === 'title' || gameState === 'dead') {
+    poseWalker(elapsed, false);
+    walker.position.set(player.x, player.y, player.z);
+    walker.rotation.y = player.yaw;
+    updateWorld(dt, elapsed);
+  } else if (gameState === 'perk') {
+    poseWalker(elapsed, false);
+  }
+
+  updateCamera(dt);
+  renderer.render(scene, camera);
+  drawHUD(elapsed);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// debug/telemetry handle for automated testing and motion-capture export
+if (location.search.includes('debug')) {
+  window.__walker = {
+    player, run, stats, delivery, storms, telemetry,
+    get state() { return gameState; },
+    get perkOffers() { return perkOffers.map((o) => o.name); },
+    get chunks() { return chunks.size; },
+    get salvage() { return salvageList.length; },
+    teleport(x, z) { player.x = x; player.z = z; player.y = WALK(x, z); },
+    goToDelivery() { player.x = delivery.x; player.z = delivery.z; player.y = WALK(delivery.x, delivery.z); },
+  };
+}
+</script>
+</body>
+</html>
